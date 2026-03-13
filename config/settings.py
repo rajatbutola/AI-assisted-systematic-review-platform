@@ -1,3 +1,13 @@
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+NCBI_EMAIL = os.getenv("NCBI_EMAIL")
+NCBI_API_KEY = os.getenv("NCBI_API_KEY")
+
+
+
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 MAX_INPUT_TOKENS = 1800
 
