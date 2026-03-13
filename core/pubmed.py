@@ -10,8 +10,8 @@ from models.schemas import Article
 
 logger = logging.getLogger(__name__)
 
-Entrez.email = os.environ.get("NCBI_EMAIL", "ricky.rab20@gmail.com")
-Entrez.api_key = os.environ.get("0967e0e563dda8121cd04f88403736449608")
+Entrez.email = os.environ.get("NCBI_EMAIL", "yourmail@webb.com")
+Entrez.api_key = os.environ.get("YourKey")
 
 
 def search_pubmed(query: str, max_results: int = 20, max_retries: int = 3) -> List[str]:
