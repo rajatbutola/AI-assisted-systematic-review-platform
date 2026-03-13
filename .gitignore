@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Mac / Windows
+.DS_Store
+Thumbs.db
+
+# Models
+*.gguf
+models/
+
+# Streamlit cache
+.streamlit/
