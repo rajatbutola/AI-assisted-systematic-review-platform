@@ -11,6 +11,7 @@ def score_relevance(abstract: str) -> Optional[float]:
 
     prompt = RELEVANCE_SCORING_PROMPT.format(abstract=abstract)
     raw_output = run_inference(prompt, task="scoring")
+    print(f"RAW SCORER OUTPUT: '{raw_output}'")  # Add this line
     return parse_score(raw_output)
 
 

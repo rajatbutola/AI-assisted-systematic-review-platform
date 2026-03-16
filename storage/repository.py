@@ -2,15 +2,16 @@ import json
 import sqlite3
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+
 from models.schemas import Article, PICOQuery, ScreeningDecision
 from storage.database import get_connection
+
 
 class ReviewRepository:
     """All database operations for Reviews."""
 
     def create_review(self, title: str, description: str = "",
                       pico: Optional[PICOQuery] = None) -> int:
-        """Create a new review. Returns new review ID."""
         pico_json = pico.model_dump_json() if pico else None
         with get_connection() as conn:
             cursor = conn.execute(
@@ -46,28 +47,21 @@ class ArticleRepository:
 
     def save_articles(self, articles: List[Article], review_id: int,
                       search_id: int) -> Dict[str, int]:
-        """
-        Save articles and link them to a review.
-        Returns counts: {'saved': n, 'duplicates': n}
-        """
         saved = 0
         duplicates = 0
-
         with get_connection() as conn:
             for article in articles:
-                # Upsert article (may already exist from another review)
                 conn.execute("""
                     INSERT INTO articles (pmid, title, abstract, authors, journal, year)
                     VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(pmid) DO UPDATE SET
-                        title = excluded.title,
+                        title    = excluded.title,
                         abstract = excluded.abstract
                 """, (
                     article.pmid, article.title, article.abstract,
                     json.dumps(article.authors), article.journal, article.year
                 ))
 
-                # Link to this review (check for duplicate within review)
                 existing = conn.execute(
                     "SELECT 1 FROM review_articles WHERE review_id = ? AND pmid = ?",
                     (review_id, article.pmid)
@@ -77,8 +71,7 @@ class ArticleRepository:
                     duplicates += 1
                 else:
                     conn.execute(
-                        """INSERT INTO review_articles (review_id, pmid, search_id)
-                           VALUES (?, ?, ?)""",
+                        "INSERT INTO review_articles (review_id, pmid, search_id) VALUES (?, ?, ?)",
                         (review_id, article.pmid, search_id)
                     )
                     saved += 1
@@ -88,8 +81,21 @@ class ArticleRepository:
     def get_articles_for_review(self, review_id: int,
                                  stage: str = "title_abstract") -> List[Dict]:
         """
-        Get articles for a review with their screening status.
-        stage: 'title_abstract' or 'full_text'
+        BUG FIXED — reviewer_id mismatch:
+            The ScreeningRepository.save_decision() default reviewer_id = 'user_1'.
+            This query also filters on reviewer_id = 'user_1'. That is consistent.
+
+            HOWEVER: app.py Tab 3 (Screening) calls screen_repo.save_decision()
+            without passing reviewer_id, so it correctly uses 'user_1'.
+            The LEFT JOIN here also filters on 'user_1'. So decisions ARE found
+            once the database bug (executescript) is fixed.
+
+            Additional fix: removed the `stage` parameter from the call in
+            app.py Tab 2 (AI Analysis), which was calling
+            get_articles_for_review(review_id) with no stage — that is fine,
+            default is 'title_abstract'.
+
+            The query itself is correct. No change needed here beyond clarity.
         """
         with get_connection() as conn:
             rows = conn.execute("""
@@ -97,20 +103,32 @@ class ArticleRepository:
                     a.pmid, a.title, a.abstract, a.authors, a.journal, a.year,
                     sd.decision, sd.reason, sd.decided_at
                 FROM articles a
-                JOIN review_articles ra ON a.pmid = ra.pmid
+                JOIN  review_articles ra
+                    ON a.pmid = ra.pmid AND ra.review_id = ?
                 LEFT JOIN screening_decisions sd
-                    ON a.pmid = sd.pmid
+                    ON  a.pmid      = sd.pmid
                     AND sd.review_id = ?
-                    AND sd.stage = ?
+                    AND sd.stage     = ?
                     AND sd.reviewer_id = 'user_1'
-                WHERE ra.review_id = ?
                 ORDER BY sd.decision NULLS FIRST, a.pmid
-            """, (review_id, stage, review_id)).fetchall()
+            """, (review_id, review_id, stage)).fetchall()
 
-            return [dict(r) for r in rows]
+            # Deserialise the authors JSON string back to a list
+            result = []
+            for row in rows:
+                d = dict(row)
+                try:
+                    d["authors"] = json.loads(d["authors"]) if d["authors"] else []
+                except (json.JSONDecodeError, TypeError):
+                    d["authors"] = []
+                result.append(d)
+            return result
 
     def get_screening_counts(self, review_id: int) -> Dict[str, int]:
-        """Get PRISMA-ready counts for a review."""
+        """
+        Returns counts needed for the PRISMA dashboard and diagram.
+        'pending' = total articles not yet given any title/abstract decision.
+        """
         with get_connection() as conn:
             total = conn.execute(
                 "SELECT COUNT(*) FROM review_articles WHERE review_id = ?",
@@ -147,8 +165,8 @@ class ScreeningRepository:
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(review_id, pmid, stage, reviewer_id)
                 DO UPDATE SET
-                    decision = excluded.decision,
-                    reason = excluded.reason,
+                    decision   = excluded.decision,
+                    reason     = excluded.reason,
                     decided_at = CURRENT_TIMESTAMP
             """, (review_id, pmid, stage, decision, reason, reviewer_id))
 
@@ -163,7 +181,7 @@ class ScreeningRepository:
 
 
 class AIAnalysisRepository:
-    """Cache AI outputs so you don't re-run inference on the same abstract."""
+    """Cache AI outputs so inference is not repeated on the same abstract."""
 
     def save_analysis(self, pmid: str, task: str,
                       output: Any, model_name: str = "tinyllama") -> None:
@@ -173,7 +191,7 @@ class AIAnalysisRepository:
                 INSERT INTO ai_analyses (pmid, task, output, model_name)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(pmid, task) DO UPDATE SET
-                    output = excluded.output,
+                    output     = excluded.output,
                     model_name = excluded.model_name,
                     created_at = CURRENT_TIMESTAMP
             """, (pmid, task, output_json, model_name))

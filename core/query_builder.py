@@ -21,5 +21,5 @@ def build_query(
         raise ValueError("Please enter at least one PICO field before searching.")
 
     query = " AND ".join(terms)
-    query += f' AND ("{year_from}"[Date - Publication] : "{year_to}"[Date - Publication])'
+    query += f" AND {year_from}:{year_to}[dp]"
     return query
