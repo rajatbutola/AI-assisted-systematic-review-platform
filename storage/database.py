@@ -1,3 +1,5 @@
+# storage/database.py
+
 import sqlite3
 import json
 from pathlib import Path
@@ -6,7 +8,6 @@ from datetime import datetime
 from typing import Optional
 
 DB_PATH = Path("sr_platform.db")
-
 
 @contextmanager
 def get_connection():
@@ -23,7 +24,6 @@ def get_connection():
         raise
     finally:
         conn.close()
-
 
 def init_database() -> None:
     """
@@ -123,3 +123,4 @@ def init_database() -> None:
                 UNIQUE (review_id, pmid, field_name)
             )
         """)
+

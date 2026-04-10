@@ -1,3 +1,15 @@
+# pipeline/pico_extractor.py 25th March, 2026
+# Enhanced PICO extractor — now also captures study_design and sample_size.
+
+
+# pipeline/pico_extractor.py  — v2 27th March
+# Hardened parser identical in structure to quality_assessor v2.
+
+
+
+# pipeline/pico_extractor.py  — v3 31st March
+# Hardened parser identical in structure to quality_assessor v2.
+
 import json
 import logging
 import re
@@ -11,72 +23,72 @@ logger = logging.getLogger(__name__)
 
 
 def extract_pico(abstract: str) -> PICOExtraction:
-    """Extract PICO elements from an abstract using the LLM."""
-
     if not abstract or not abstract.strip():
         return PICOExtraction()
-
     try:
         prompt = PICO_EXTRACTION_PROMPT.format(abstract=abstract)
-
-        raw_output = run_inference(prompt, task="extraction")
-
-        # Try JSON parsing first
-        parsed = _try_parse_json(raw_output)
-        if parsed:
-            return parsed
-
-        logger.warning("JSON parsing failed, falling back to line parsing.")
-
-        # Fallback parser
-        return _parse_lines(raw_output)
-
+        raw    = run_inference(prompt, task="extraction")
+        logger.debug("PICO raw output: %r", raw[:300])
+        return _parse_pico(raw)
     except Exception as e:
-        logger.error(f"PICO extraction failed: {e}")
-
+        logger.error("PICO extraction failed: %s", e)
         return PICOExtraction()
 
 
-def _try_parse_json(text: str) -> Optional[PICOExtraction]:
-    """Attempt to parse JSON output from the LLM."""
+def _parse_pico(text: str) -> PICOExtraction:
+    """
+    Parse PICO JSON from LLM output.
+    The new prompt provides a filled template so the model knows the exact
+    schema. We still do robust extraction in case of leading text.
+    """
+    start = text.find("{")
+    if start == -1:
+        logger.warning("No JSON in PICO output: %r", text[:200])
+        return _line_fallback_pico(text)
+
+    end = text.rfind("}") + 1
+    if end == 0:
+        text = text + "}"
+        end  = len(text)
+
+    json_str = text[start:end]
+
+    # Fix doubled braces
+    if json_str.startswith("{{"):
+        json_str = json_str[1:]
+    if json_str.endswith("}}"):
+        json_str = json_str[:-1]
 
     try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-
-        if start == -1 or end == 0:
-            return None
-
-        json_text = text[start:end]
-
-        data = json.loads(json_text)
-
+        data = json.loads(json_str)
         return PICOExtraction(
-            population=str(data.get("population", "")),
-            intervention=str(data.get("intervention", "")),
-            comparison=str(data.get("comparison", "")),
-            outcome=str(data.get("outcome", "")),
+            population=   str(data.get("population",   "") or "").strip(),
+            intervention= str(data.get("intervention", "") or "").strip(),
+            comparison=   str(data.get("comparison",   "") or "").strip(),
+            outcome=      str(data.get("outcome",      "") or "").strip(),
         )
+    except json.JSONDecodeError as e:
+        logger.warning("PICO JSON parse failed (%s): %r", e, json_str[:300])
+        return _line_fallback_pico(text)
 
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
 
-
-def _parse_lines(text: str) -> PICOExtraction:
-    """Fallback parser when JSON is not returned."""
-
-    result = {
-        "population": "",
-        "intervention": "",
-        "comparison": "",
-        "outcome": "",
-    }
-
+def _line_fallback_pico(text: str) -> PICOExtraction:
+    """Extract PICO from plain-text output when JSON parsing fails."""
+    result = {"population": "", "intervention": "", "comparison": "", "outcome": ""}
     for line in text.splitlines():
         line = line.strip()
-
-        for key in result.keys():
+        for key in result:
             if re.match(rf"^{key}\s*:", line, re.IGNORECASE):
                 result[key] = line.split(":", 1)[1].strip()
-
     return PICOExtraction(**result)
+
+
+
+
+
+
+
+
+
+
+
