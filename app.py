@@ -155,6 +155,16 @@
 
 
 
+# app.py — v7
+# v7: UMLS concept expansion integrated into PICO search form
+#
+# v5 fixes (unchanged):
+#   FIX 1 — PRISMA source count accumulation (cumulative from DB, not overwrite)
+#   FIX 2 — Unified full-text tab: 3-pass additive strategy (NCBI → Europe PMC → Unpaywall)
+#   FIX 3 — PRISMA diagram arrow rendering (SVG path shapes)
+
+
+
 
 
 import logging
@@ -334,17 +344,75 @@ def _sort_articles(articles: List[Article], sort_by: str) -> List[Article]:
 
 # ── Deduplication helper ──────────────────────────────────────────────────────
 
-def _deduplicate(list_a: List[Article], list_b: List[Article]):
-    seen: Dict[str, Article] = {}
+def _clean_doi(doi_raw: str) -> str:
+    """Normalise DOI to bare 10.xxxx/... form for comparison."""
+    doi = (doi_raw or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/",
+                   "https://dx.doi.org/", "doi:"):
+        if doi.startswith(prefix):
+            doi = doi[len(prefix):]
+            break
+    return doi.strip()
+
+
+def _title_key(title: str) -> str:
+    """Normalised title key: lowercase, strip punctuation, first 60 chars."""
+    import re
+    t = re.sub(r"[^a-z0-9 ]", "", (title or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:60]
+
+
+def _deduplicate(*lists) -> tuple:
+    """
+    Deduplicate articles across any number of source lists.
+
+    Three-key matching (tried in order, highest precision first):
+      1. pmid  — exact match (PubMed ↔ Europe PMC)
+      2. doi   — normalised DOI (catches CORE vs PubMed/EPMC duplicates,
+                  because CORE articles use DOI as their pmid field)
+      3. title — first 60 chars, lowercased, punctuation stripped
+                  (last resort for articles with neither pmid nor doi)
+
+    Returns
+    -------
+    (unique_articles: List[Article], n_duplicates: int)
+    Earlier lists take priority over later ones (first-seen wins).
+    """
+    seen_pmid:  Dict[str, Article] = {}
+    seen_doi:   Dict[str, Article] = {}
+    seen_title: Dict[str, Article] = {}
+    unique:     list = []
     dupes = 0
-    for art in list_a:
-        seen[art.pmid] = art
-    for art in list_b:
-        if art.pmid in seen:
-            dupes += 1
-        else:
-            seen[art.pmid] = art
-    return list(seen.values()), dupes
+
+    for art_list in lists:
+        for art in (art_list or []):
+            pmid  = (art.pmid or "").strip()
+            doi   = _clean_doi(art.doi or "")
+            # CORE articles store their DOI as the pmid field — detect that
+            if not doi and pmid.startswith("10."):
+                doi = pmid   # CORE uid IS the doi
+            title = _title_key(art.title or "")
+
+            # Check for duplicate using any key
+            is_dupe = (
+                (pmid  and pmid  in seen_pmid)  or
+                (doi   and doi   in seen_doi)   or
+                (title and title in seen_title)
+            )
+
+            if is_dupe:
+                dupes += 1
+            else:
+                unique.append(art)
+                if pmid:
+                    seen_pmid[pmid]   = art
+                if doi:
+                    seen_doi[doi]     = art
+                if title:
+                    seen_title[title] = art
+
+    return unique, dupes
 
 
 # ── FIX 1: PICO change detection ─────────────────────────────────────────────
@@ -512,12 +580,8 @@ def _render_unified_fulltext_tab(review_id: int, pmc_cl, article_repo):
         st.info("Search for articles first, then use this tab to find full texts.")
         return
 
-    # Deduplicate across all three sources by pmid/uid
-    seen: dict = {}
-    for art in pubmed_arts + epmc_arts + core_arts:
-        if art.pmid not in seen:
-            seen[art.pmid] = art
-    all_unique = list(seen.values())
+    # Deduplicate across all three sources (pmid + doi + title)
+    all_unique, _ = _deduplicate(pubmed_arts, epmc_arts, core_arts)
     n_total = len(all_unique)
 
     # Split for pass routing: real PMIDs, EPMC-prefixed, CORE-prefixed
@@ -1179,6 +1243,34 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         ),
     )
 
+    # ── UMLS toggle (outside form so it can read settings) ───────────────────
+    from config.settings import UMLS_API_KEY as _UMLS_KEY
+    _umls_available = bool(_UMLS_KEY)
+
+    if _umls_available:
+        use_umls = st.toggle(
+            "🔬 Use UMLS concept expansion",
+            value=True,
+            key="use_umls_toggle",
+            help=(
+                "When enabled, each PICO field is mapped to a UMLS Concept Unique "
+                "Identifier (CUI). The search query is enriched with:\n\n"
+                "• **MeSH preferred term** → added as `[MeSH Terms]` in PubMed "
+                "(high recall via MeSH explosion, includes narrower terms)\n"
+                "• **Synonyms** from all UMLS source vocabularies (trade names, "
+                "abbreviations, variant spellings)\n"
+                "• **ChEMBL fallback** for new drugs not yet in UMLS\n\n"
+                "Disable for simple keyword-only searches."
+            ),
+        )
+    else:
+        use_umls = False
+        st.info(
+            "💡 **UMLS expansion not active.** Add `UMLS_API_KEY` to your `.env` "
+            "to enable MeSH term lookup and synonym expansion for higher-recall "
+            "queries. Register free at https://uts.nlm.nih.gov/uts/signup-login"
+        )
+
     with st.form("pico_form"):
         population   = st.text_input("Population",   placeholder="e.g. adults with CLL")
         intervention = st.text_input("Intervention", placeholder="e.g. venetoclax")
@@ -1188,7 +1280,7 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         col1, col2, col3 = st.columns(3)
         year_from   = col1.number_input("Year From", 1900, 2100, 2015)
         year_to     = col2.number_input("Year To",   1900, 2100, 2025)
-        max_results = col3.slider("Max Results", 1, 200, 20)
+        max_results = col3.slider("Max Results", 1, 2000, 10)
 
         study_type = st.radio(
             "Study Type Filter",
@@ -1218,6 +1310,7 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
                 "max_results":  max_results,
                 "study_type":   study_type,
                 "new_fp":       new_fp,
+                "use_umls":     use_umls,
             }
             st.rerun()
         else:
@@ -1225,7 +1318,7 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
             _do_search(review_id, source_name, population, intervention,
                        comparison, outcome, year_from, year_to,
                        max_results, study_type, pubmed_cl, epmc_cl,
-                       search_repo, article_repo)
+                       search_repo, article_repo, use_umls=use_umls)
 
     if pending:
         p = pending
@@ -1254,6 +1347,7 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
                     p["comparison"], p["outcome"], p["year_from"], p["year_to"],
                     p["max_results"], p["study_type"],
                     pubmed_cl, epmc_cl, search_repo, article_repo,
+                    use_umls=p.get("use_umls", False),
                 )
 
         with c2:
@@ -1292,18 +1386,11 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         key=f"sort_medical_{review_id}",
     )
 
-    # Multi-source dedup: accumulate across all three sources
-    _all_src = [a for lst in [pubmed_articles, epmc_articles, core_articles]
-                for a in lst]
-    if len([x for x in [pubmed_articles, epmc_articles, core_articles] if x]) > 1:
-        seen_pmids: dict = {}
-        n_dupes = 0
-        for a in _all_src:
-            if a.pmid in seen_pmids:
-                n_dupes += 1
-            else:
-                seen_pmids[a.pmid] = a
-        combined = list(seen_pmids.values())
+    # Multi-source dedup: 3-key matching across all sources
+    # Catches: PubMed↔EPMC (pmid), PubMed/EPMC↔CORE (doi), title fallback
+    n_searched = sum(1 for x in [pubmed_articles, epmc_articles, core_articles] if x)
+    if n_searched > 1:
+        combined, n_dupes = _deduplicate(pubmed_articles, epmc_articles, core_articles)
         _store(review_id, "n_duplicates_removed", n_dupes)
         _refresh_prisma_from_db(review_id)
         parts = []
@@ -1332,8 +1419,24 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
 
     tabs_out = st.tabs(tab_labels)
 
+    # Track which source corresponds to each tab (for query lookup)
+    _tab_sources = []
+    if pubmed_articles:  _tab_sources.append("PubMed")
+    if epmc_articles:    _tab_sources.append("Europe PMC")
+    if core_articles:    _tab_sources.append("CORE")
+
     for i, (tab, articles_list) in enumerate(zip(tabs_out, tab_data)):
+        src = _tab_sources[i] if i < len(_tab_sources) else ""
         with tab:
+            # Persistent query — stored before st.rerun(), displayed after
+            _q = _load(review_id, f"query_{src}")
+            _ql = _load(review_id, f"query_label_{src}", "Query")
+            if _q:
+                with st.expander(
+                    f" {_ql} — click to view / copy full query",
+                    expanded=False
+                ):
+                    st.code(_q, language="text")
             _render_article_cards(articles_list, pmc_urls={}, sort_by=sort_by)
 
     with tabs_out[-1]:
@@ -1343,34 +1446,80 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
 def _do_search(review_id, source_name, population, intervention,
                comparison, outcome, year_from, year_to,
                max_results, study_type, pubmed_cl, epmc_cl,
-               search_repo, article_repo):
-    # Route CORE searches to dedicated handler
-    if source_name == "CORE":
-        _do_core_search(
-            review_id, population, intervention, comparison, outcome,
-            year_from, year_to, max_results, search_repo, article_repo,
-        )
-        return
+               search_repo, article_repo, use_umls: bool = False):
+    """
+    Run a database search, optionally with UMLS concept expansion.
 
+    When use_umls=True:
+      1. Each PICO field is mapped to a UMLS CUI via /search/current
+      2. MeSH preferred term retrieved via /atoms (sabs=MSH)
+      3. Synonyms collected from all English vocabulary atoms
+      4. ChEMBL fallback for new drugs not yet in UMLS
+      5. PubMed query uses: MeSH[MeSH Terms] OR orig[tiab] OR syn1[tiab] ...
+      6. Europe PMC query uses: TITLE/ABSTRACT for all terms
+      7. The original PICO-based query is shown alongside the UMLS query
+
+    When use_umls=False (or UMLS unavailable):
+      Falls back to the existing build_query / build_epmc_query logic.
+    """
     try:
-        if source_name == "PubMed":
-            query  = build_query(
-                population=population, intervention=intervention,
-                comparison=comparison, outcome=outcome,
-                year_from=int(year_from), year_to=int(year_to),
-                study_type=study_type,
-            )
-            client = pubmed_cl
-        else:
-            query  = build_epmc_query(
-                population=population, intervention=intervention,
-                comparison=comparison, outcome=outcome,
-                year_from=int(year_from), year_to=int(year_to),
-                study_type=study_type,
-            )
-            client = epmc_cl
+        from core.query_builder import STUDY_TYPE_FILTERS, EPMC_STUDY_TYPE_FILTERS
 
-        st.write("**Generated Query:**"); st.code(query)
+        # ── UMLS expansion (runs for ALL sources including CORE) ─────────────
+        # Build concept_set before routing, so CORE gets the expanded query too.
+        if use_umls:
+            _, concept_set = _build_umls_query(
+                source_name="PubMed",   # field expansion is source-independent
+                population=population, intervention=intervention,
+                comparison=comparison, outcome=outcome,
+                year_from=int(year_from), year_to=int(year_to),
+                study_type=study_type,
+            )
+            if concept_set:
+                _render_umls_expansion_detail(concept_set, source_name)
+        else:
+            concept_set = None
+
+        # ── Route CORE to its dedicated handler (with UMLS query if available) ─
+        if source_name == "CORE":
+            core_q = (concept_set.core_query
+                      if concept_set and concept_set.core_query else None)
+            _do_core_search(
+                review_id, population, intervention, comparison, outcome,
+                year_from, year_to, max_results, search_repo, article_repo,
+                expanded_query=core_q,
+            )
+            return
+
+        # ── Build query for PubMed / Europe PMC ──────────────────────────────
+        query = None
+        if use_umls and concept_set:
+            query = (concept_set.pubmed_query if source_name == "PubMed"
+                     else concept_set.epmc_query) or None
+
+        # ── Standard path (or UMLS fallback if expansion failed) ─────────────
+        if not query:
+            if source_name == "PubMed":
+                query = build_query(
+                    population=population, intervention=intervention,
+                    comparison=comparison, outcome=outcome,
+                    year_from=int(year_from), year_to=int(year_to),
+                    study_type=study_type,
+                )
+            else:
+                query = build_epmc_query(
+                    population=population, intervention=intervention,
+                    comparison=comparison, outcome=outcome,
+                    year_from=int(year_from), year_to=int(year_to),
+                    study_type=study_type,
+                )
+
+        # Store query persistently — displayed in results tab after rerun
+        _store(review_id, f"query_{source_name}", query)
+        _store(review_id, f"query_label_{source_name}",
+               "🔬 UMLS-expanded" if (use_umls and concept_set) else "📝 Original PICO")
+
+        client = pubmed_cl if source_name == "PubMed" else epmc_cl
 
         with st.spinner(f"Searching {source_name}…"):
             articles  = client.search_and_fetch(query, max_results)
@@ -1402,25 +1551,117 @@ def _do_search(review_id, source_name, population, intervention,
         st.error(f"Search error: {e}")
 
 
+def _build_umls_query(source_name: str,
+                      population: str, intervention: str,
+                      comparison: str, outcome: str,
+                      year_from: int, year_to: int,
+                      study_type: str):
+    """
+    Build a UMLS-expanded query for PubMed or Europe PMC.
+
+    Returns (query_string, ConceptSet) or (None, None) on failure.
+    The caller falls back to the standard query builder if this returns None.
+    """
+    from core.concept_expander import get_concept_expander
+    from core.query_builder import STUDY_TYPE_FILTERS, EPMC_STUDY_TYPE_FILTERS
+
+    try:
+        expander = get_concept_expander()
+        if not expander.umls_available:
+            logger.info("UMLS expander not available — falling back to standard query")
+            return None, None
+
+        # Get study-type filter strings for each database
+        st_pubmed = STUDY_TYPE_FILTERS.get(study_type, "")
+        st_epmc   = EPMC_STUDY_TYPE_FILTERS.get(study_type, "")
+
+        with st.spinner("🔬 UMLS: mapping concepts and expanding synonyms…"):
+            cs = expander.expand(
+                population=population,
+                intervention=intervention,
+                comparison=comparison,
+                outcome=outcome,
+                year_from=year_from,
+                year_to=year_to,
+                study_type_filter_pubmed=st_pubmed,
+                study_type_filter_epmc=st_epmc,
+            )
+
+        if source_name == "PubMed":
+            query = cs.pubmed_query
+        else:
+            query = cs.epmc_query
+
+        if not query:
+            logger.warning("UMLS expansion produced empty query — falling back")
+            return None, None
+
+        return query, cs
+
+    except Exception as e:
+        logger.error("UMLS query build failed: %s", e)
+        st.warning(f"⚠️ UMLS expansion failed ({e}). Falling back to standard query.")
+        return None, None
+
+
+def _render_umls_expansion_detail(concept_set, source_name: str) -> None:
+    """
+    Show an expandable panel with per-field UMLS expansion results.
+    Lets the researcher verify what MeSH terms and synonyms were used.
+    """
+    with st.expander("🔬 UMLS Concept Expansion Detail", expanded=False):
+        if not concept_set.umls_used:
+            st.warning("UMLS was not used for any field — API may be unavailable.")
+            return
+
+        for label, fe in concept_set.fields:
+            if not fe:
+                continue
+            cols = st.columns([1, 2, 2])
+            cols[0].markdown(f"**{label}**")
+            cols[0].caption(f"*{fe.original}*")
+
+            if fe.concept:
+                cols[1].markdown(f"**CUI:** `{fe.concept.cui}`")
+                cols[1].markdown(f"**UMLS name:** {fe.concept.name}")
+                if fe.mesh_term:
+                    cols[1].markdown(f"**MeSH:** `{fe.mesh_term}`")
+                if fe.concept.semantic_names:
+                    cols[1].caption(
+                        "Semantic type: " + ", ".join(fe.concept.semantic_names[:2])
+                    )
+            else:
+                cols[1].caption(f"No UMLS concept found — using raw text")
+
+            if fe.synonyms:
+                cols[2].markdown("**Synonyms used:**")
+                for syn in fe.synonyms[:6]:
+                    cols[2].caption(f"  · {syn}")
+            else:
+                cols[2].caption("No synonyms added")
+
+            src_badge = {"umls": "🔬 UMLS", "chembl": "💊 ChEMBL",
+                         "original": "📝 Raw text"}.get(fe.source, fe.source)
+            cols[2].caption(f"Source: {src_badge}")
+
+        st.divider()
+        st.caption(
+            f"**Expansion log:** " + " | ".join(concept_set.expansion_log[:6])
+        )
+
+
 def _do_core_search(review_id, population, intervention, comparison,
                     outcome, year_from, year_to, max_results,
-                    search_repo, article_repo):
+                    search_repo, article_repo,
+                    expanded_query: str = None):
     """
-    Search CORE Aggregate API (https://core.ac.uk) using PICO fields.
+    Search CORE Aggregate API (https://core.ac.uk).
 
-    CORE v3 /search/works endpoint accepts free-text boolean queries.
-    Authentication: Bearer token (CORE_API_KEY from .env).
-
-    PICO mapping: each non-empty field is wrapped in quotes and joined with AND.
-    Year range added as yearPublished filter.
-
-    CORE returns: id, title, abstract, authors, yearPublished, doi,
-    downloadUrl (permanent hosted PDF), fullTextLink, publisher, links[].
-
-    Articles are stored with source=EUROPE_PMC (reusing existing enum) and
-    uid = doi if available, else "CORE:{id}".
-    The downloadUrl is encoded in the full_text field as "PDF:{url}" so the
-    article card renderer can display a Download PDF link without schema changes.
+    Parameters
+    ----------
+    expanded_query : UMLS-expanded query string (from concept_expander).
+                     When provided, used instead of raw PICO text.
+                     Contains synonyms in CORE Boolean free-text format.
     """
     import requests
     from models.schemas import Article, ArticleSource, ResearchDomain
@@ -1430,18 +1671,29 @@ def _do_core_search(review_id, population, intervention, comparison,
         st.error("CORE_API_KEY not found in .env. Please add it and restart the app.")
         return
 
-    # Build free-text query from non-empty PICO fields
-    terms = [t.strip() for t in [population, intervention, comparison, outcome]
-             if t.strip()]
-    if not terms:
-        st.error("Please fill at least one PICO field to search CORE.")
-        return
+    # ── Build query: UMLS-expanded OR raw PICO fallback ───────────────────────
+    if expanded_query:
+        # Strip yearPublished clauses — CORE requires them as separate API params
+        import re as _re
+        query     = _re.sub(r' AND yearPublished[><=]+\d{4}', '', expanded_query).strip()
+        umls_label = "🔬 UMLS-expanded"
+    else:
+        terms = [t.strip() for t in [population, intervention, comparison, outcome]
+                 if t.strip()]
+        if not terms:
+            st.error("Please fill at least one PICO field to search CORE.")
+            return
+        query      = " AND ".join(f'("{t}")' for t in terms)
+        umls_label = "📝 Original PICO"
 
-    query = " AND ".join(f'("{t}")' for t in terms)
-    if year_from and year_to:
-        query += f" AND yearPublished>={int(year_from)} AND yearPublished<={int(year_to)}"
+    # yearPublished MUST be a separate API param — NOT embedded in q
+    core_params: dict = {"q": query, "limit": max_results}
+    if year_from:
+        core_params["yearPublished"] = f">={int(year_from)}"
 
-    st.write("**Generated CORE Query:**"); st.code(query)
+    # Store for persistent display in results tab
+    _store(review_id, "query_CORE", query)
+    _store(review_id, "query_label_CORE", umls_label)
 
     oa_email = NCBI_EMAIL or "research@example.com"
     headers  = {
@@ -1453,13 +1705,23 @@ def _do_core_search(review_id, population, intervention, comparison,
         try:
             resp = requests.get(
                 "https://api.core.ac.uk/v3/search/works",
-                params={"q": query, "limit": max_results},
+                params=core_params,
                 headers=headers,
                 timeout=30,
             )
             if resp.status_code == 401:
                 st.error("CORE API key rejected (401). Check CORE_API_KEY in .env.")
                 return
+            if resp.status_code == 500:
+                # CORE Elasticsearch occasionally returns 500 with partial shard
+                # failures but recovers immediately. Retry once automatically.
+                logger.warning("CORE returned 500 — retrying once…")
+                import time as _time; _time.sleep(1.5)
+                resp = requests.get(
+                    "https://api.core.ac.uk/v3/search/works",
+                    params={"q": query, "limit": max_results},
+                    headers=headers, timeout=30,
+                )
             if resp.status_code != 200:
                 st.error(f"CORE API error {resp.status_code}: {resp.text[:200]}")
                 return
@@ -1601,7 +1863,8 @@ def _render_ml_form(review_id, registry, search_repo, article_repo):
             query = build_ml_query(topic=topic, keywords=keywords,
                                    venues=venue_filter,
                                    year_from=int(year_from), year_to=int(year_to))
-            st.write("**Generated Query:**"); st.code(query)
+            _store(review_id, "query_CORE", query)
+            _store(review_id, "query_label_CORE", "📝 Original PICO")
 
             with st.spinner(f"Searching {source_name}…"):
                 result_data = selected_client.search_and_fetch(query, max_results)
@@ -1687,6 +1950,16 @@ with tabs[2]:
 
 with tabs[3]:
     render_prisma_diagram(review_id)
+
+
+
+
+
+
+
+
+
+
 
 
 

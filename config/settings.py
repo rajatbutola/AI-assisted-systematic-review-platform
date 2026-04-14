@@ -24,6 +24,7 @@ load_dotenv()
 NCBI_EMAIL   = os.getenv("NCBI_EMAIL")
 NCBI_API_KEY = os.getenv("NCBI_API_KEY")
 CORE_API_KEY = os.getenv("CORE_API_KEY", "")
+UMLS_API_KEY = os.getenv("UMLS_API_KEY", "")
 
 MODEL_PATH = os.getenv(
     "MODEL_PATH",
