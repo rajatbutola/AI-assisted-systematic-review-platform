@@ -1393,6 +1393,8 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         combined, n_dupes = _deduplicate(pubmed_articles, epmc_articles, core_articles)
         _store(review_id, "n_duplicates_removed", n_dupes)
         _refresh_prisma_from_db(review_id)
+        # DB total = ground truth for unique articles (save_articles deduped them)
+        db_total = counts["total"]
         parts = []
         if pubmed_articles:
             parts.append(f"PubMed: **{len(pubmed_articles)}**")
@@ -1400,8 +1402,9 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
             parts.append(f"Europe PMC: **{len(epmc_articles)}**")
         if core_articles:
             parts.append(f"CORE: **{len(core_articles)}**")
-        parts.append(f"Duplicates: **{n_dupes}**")
-        parts.append(f"Combined unique: **{len(combined)}**")
+        n_raw = sum(len(x) for x in [pubmed_articles, epmc_articles, core_articles] if x)
+        parts.append(f"Duplicates removed: **{n_raw - db_total}**")
+        parts.append(f"Unique in DB: **{db_total}**")
         st.info("📊 **Multi-source:** " + " | ".join(parts))
 
     tab_labels = []

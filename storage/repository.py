@@ -51,56 +51,168 @@ class ArticleRepository:
 
     def save_articles(self, articles: List[Article], review_id: int,
                       search_id: int) -> Dict[str, int]:
+        """
+        Persist articles to DB with cross-source duplicate detection.
+ 
+        Three-key deduplication before inserting:
+          1. pmid  — same pmid already in DB (same-source duplicate)
+          2. doi   — same DOI, different pmid (cross-source: CORE vs PubMed/EPMC)
+          3. title — normalised title match (last resort for DOI-less articles)
+ 
+        When a cross-source duplicate is detected, we link the EXISTING article's
+        pmid to this review instead of inserting a new row. This keeps the articles
+        table clean (one row per real paper) and prevents duplicates in Screening.
+        """
         if not articles:
             return {"saved": 0, "duplicates": 0}
-
+ 
+        import re as _re
+ 
+        def _norm_doi(raw: str) -> str:
+            d = (raw or "").strip().lower()
+            for pfx in ("https://doi.org/", "http://doi.org/",
+                        "https://dx.doi.org/", "doi:"):
+                if d.startswith(pfx):
+                    d = d[len(pfx):]
+                    break
+            return d.strip()
+ 
+        def _norm_title(t: str) -> str:
+            t = _re.sub(r"[^a-z0-9 ]", "", (t or "").lower())
+            t = _re.sub(r"\s+", " ", t).strip()
+            return t[:60]
+ 
         with get_connection() as conn:
             before = conn.execute(
                 "SELECT COUNT(*) FROM review_articles WHERE review_id = ?",
                 (review_id,)
             ).fetchone()[0]
-
-            conn.executemany("""
-                INSERT INTO articles
+ 
+            # Build lookup maps from what's already in the DB for this review
+            existing_rows = conn.execute("""
+                SELECT a.pmid, a.doi, a.title
+                FROM articles a
+                JOIN review_articles ra ON a.pmid = ra.pmid
+                WHERE ra.review_id = ?
+            """, (review_id,)).fetchall()
+ 
+            db_pmid_set:  dict = {}   # pmid → canonical pmid
+            db_doi_map:   dict = {}   # norm_doi → canonical pmid
+            db_title_map: dict = {}   # norm_title → canonical pmid
+ 
+            for row in existing_rows:
+                epid  = row["pmid"]
+                edoi  = _norm_doi(row["doi"] or "")
+                etitle= _norm_title(row["title"] or "")
+                db_pmid_set[epid] = epid
+                if edoi:
+                    db_doi_map[edoi]     = epid
+                if etitle:
+                    db_title_map[etitle] = epid
+ 
+            # Also build in-batch maps (articles in current batch may dedup each other)
+            batch_doi_map:   dict = {}   # norm_doi → first article in this batch
+            batch_title_map: dict = {}   # norm_title → first article
+ 
+            articles_to_insert = []   # will go into articles table
+            review_links       = []   # (review_id, pmid, search_id) to link
+ 
+            for art in articles:
+                pmid  = (art.pmid or "").strip()
+                doi   = _norm_doi(art.doi or "")
+                # CORE articles store DOI as pmid field
+                if not doi and pmid.startswith("10."):
+                    doi = pmid
+                title = _norm_title(art.title or "")
+ 
+                # ── Check DB for existing match ────────────────────────────
+                canonical_pmid = None
+                if pmid in db_pmid_set:
+                    canonical_pmid = pmid          # exact pmid match in DB
+                elif doi and doi in db_doi_map:
+                    canonical_pmid = db_doi_map[doi]   # DOI match in DB
+                elif title and title in db_title_map:
+                    canonical_pmid = db_title_map[title]   # title match in DB
+ 
+                # ── Check within current batch ────────────────────────────
+                if canonical_pmid is None:
+                    if doi and doi in batch_doi_map:
+                        canonical_pmid = batch_doi_map[doi]
+                    elif title and title in batch_title_map:
+                        canonical_pmid = batch_title_map[title]
+ 
+                if canonical_pmid and canonical_pmid != pmid:
+                    # Cross-source duplicate: link the canonical article to review
+                    review_links.append((review_id, canonical_pmid, search_id))
+                    logger.debug(
+                        "save_articles: cross-source dedup — pmid=%r → canonical=%r "
+                        "(doi=%r title=%r)",
+                        pmid, canonical_pmid, doi, title[:40]
+                    )
+                    continue   # skip inserting this duplicate
+ 
+                # ── New article: insert and register in lookup maps ────────
+                articles_to_insert.append(art)
+                review_links.append((review_id, pmid, search_id))
+ 
+                # Update DB lookup maps so later articles in this batch see it
+                db_pmid_set[pmid] = pmid
+                if doi:
+                    db_doi_map[doi]       = pmid
+                    batch_doi_map[doi]    = pmid
+                if title:
+                    db_title_map[title]   = pmid
+                    batch_title_map[title] = pmid
+ 
+            # ── Batch insert unique articles ───────────────────────────────
+            if articles_to_insert:
+                conn.executemany("""
+                    INSERT INTO articles
                     (pmid, title, abstract, authors, journal, year,
                      doi, source, domain, url, venue, citation_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pmid) DO UPDATE SET
-                    title          = excluded.title,
-                    abstract       = excluded.abstract,
-                    source         = excluded.source,
-                    domain         = excluded.domain,
-                    venue          = excluded.venue,
-                    doi            = excluded.doi,
-                    url            = excluded.url,
-                    citation_count = excluded.citation_count
-            """, [
-                (
-                    a.pmid, a.title, a.abstract,
-                    json.dumps(a.authors), a.journal, a.year,
-                    a.doi,
-                    a.source.value if hasattr(a.source, "value") else str(a.source),
-                    a.domain.value if hasattr(a.domain, "value") else str(a.domain),
-                    a.url, a.venue, a.citation_count,
-                )
-                for a in articles
-            ])
-
-            conn.executemany("""
-                INSERT OR IGNORE INTO review_articles (review_id, pmid, search_id)
-                VALUES (?, ?, ?)
-            """, [(review_id, a.pmid, search_id) for a in articles])
-
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(pmid) DO UPDATE SET
+                        title          = excluded.title,
+                        abstract       = excluded.abstract,
+                        source         = excluded.source,
+                        domain         = excluded.domain,
+                        venue          = excluded.venue,
+                        doi            = excluded.doi,
+                        url            = excluded.url,
+                        citation_count = excluded.citation_count
+                """, [
+                    (
+                        a.pmid, a.title, a.abstract,
+                        json.dumps(a.authors), a.journal, a.year,
+                        a.doi,
+                        a.source.value if hasattr(a.source, "value") else str(a.source),
+                        a.domain.value if hasattr(a.domain, "value") else str(a.domain),
+                        a.url, a.venue, a.citation_count,
+                    )
+                    for a in articles_to_insert
+                ])
+ 
+            # ── Link all articles (canonical) to this review ───────────────
+            if review_links:
+                conn.executemany("""
+                    INSERT OR IGNORE INTO review_articles (review_id, pmid, search_id)
+                    VALUES (?, ?, ?)
+                """, review_links)
+ 
             after = conn.execute(
                 "SELECT COUNT(*) FROM review_articles WHERE review_id = ?",
                 (review_id,)
             ).fetchone()[0]
-
-        saved = after - before
-        duplicates = len(articles) - saved
-        logger.info("save_articles: review_id=%d input=%d saved=%d duplicates=%d",
-                    review_id, len(articles), saved, duplicates)
-        return {"saved": saved, "duplicates": duplicates}
+ 
+            saved      = after - before
+            duplicates = len(articles) - saved
+            logger.info(
+                "save_articles: review_id=%d input=%d unique=%d "
+                "cross-source-dupes=%d saved=%d",
+                review_id, len(articles), len(articles_to_insert),
+                len(articles) - len(articles_to_insert), saved
+            )
+            return {"saved": saved, "duplicates": duplicates}
 
 # ── ADD these two methods to ArticleRepository in storage/repository.py ──────
 #
