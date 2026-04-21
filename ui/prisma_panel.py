@@ -169,6 +169,49 @@
 #
 # ═══════════════════════════════════════════════════════════════════
 
+
+
+
+
+
+
+
+
+# ui/prisma_panel.py — v5
+#
+# ═══════════════════════════════════════════════════════════════════
+# COMPLETE REWRITE OF THE FIGURE BUILDER
+# ═══════════════════════════════════════════════════════════════════
+#
+# ROOT CAUSE OF ARROW MISALIGNMENT (definitive fix):
+#
+# All previous versions used Plotly "annotation" objects with
+# axref/ayref="x", yref/xref="x" to draw arrows. This approach has
+# a fundamental flaw: the "tail" (ax, ay) uses DATA coordinates, but
+# data coordinates are mapped to pixel coordinates by Plotly's internal
+# axis scaling, which depends on the figure size, margins, and the
+# visible range. Small rounding differences cause the arrow tail to
+# stop 5–15 pixels short of the box edge.
+#
+# THE FIX: Switch the entire figure to PAPER coordinates (0.0–1.0,
+# normalised to the figure dimensions). In paper coordinates:
+#   - Boxes are drawn as go.layout.Shape with xref="paper", yref="paper"
+#   - Text is added with go.layout.Annotation with xref="paper", yref="paper"
+#   - Arrows are drawn as go.layout.Shape type="path" using SVG path strings
+#     e.g. "M x1 y1 L x2 y2" in paper coordinates
+# Because everything uses the same paper coordinate system, there is no
+# coordinate-system mismatch and arrows touch boxes exactly.
+#
+# PRISMA 2020 LAYOUT (from images 1–5 provided by user):
+#   Stage labels: vertical text on left (blue bars)
+#   Single source: Identification → [Duplicates right] → Screening → [Excluded right]
+#                  → Eligibility → [Full-text excl. right] → Included
+#   Multi source:  [DB1 box] [DB2 box] → merge → [Dedup box right] → Screening → ...
+#   All side boxes connected by horizontal arrows FROM main column
+#   All stage boxes connected by vertical arrows between rows
+#
+# ═══════════════════════════════════════════════════════════════════
+
 import json
 import logging
 import math
@@ -177,11 +220,12 @@ from typing import Dict, List, Optional
 import plotly.graph_objects as go
 import streamlit as st
 
-from storage.repository import ArticleRepository, PrismaSettingsRepository
+from storage.repository import ArticleRepository, ScreeningRepository, PrismaSettingsRepository
 
 logger = logging.getLogger(__name__)
 
-article_repo  = ArticleRepository()
+article_repo   = ArticleRepository()
+screening_repo = ScreeningRepository()
 settings_repo = PrismaSettingsRepository()
 
 # ── Colour palettes ───────────────────────────────────────────────────────────
@@ -249,6 +293,34 @@ _DEFAULT_SETTINGS = {
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+
+# ── Exclusion reason display helpers ──────────────────────────────────────────
+_REASON_LABELS = {
+    "wrong_population":   "Wrong population",
+    "wrong_intervention": "Wrong intervention",
+    "wrong_comparator":   "Wrong comparator",
+    "wrong_outcome":      "Wrong outcome",
+    "wrong_study_design": "Wrong study design",
+    "animal_study":       "Animal study",
+    "conference_abstract":"Conference abstract",
+    "duplicate":          "Duplicate",
+    "language_barrier":   "Language barrier",
+    "small_sample":       "Sample size too small",
+    "no_control":         "No control group",
+    "other":              "Other",
+}
+
+def _build_excluded_label(n_excluded: int, reason_counts: dict) -> str:
+    """Build the PRISMA excluded box label with reason breakdown."""
+    lines = [f"<b>Records excluded</b>", f"(title/abstract)", f"(n = {n_excluded:,})"]
+    if reason_counts:
+        # Sort by count descending, show top 6
+        top = sorted(reason_counts.items(), key=lambda x: -x[1])[:6]
+        for tag, count in top:
+            label = _REASON_LABELS.get(tag, tag.replace("_", " ").title())
+            lines.append(f"{label}: {count}")
+    return "<br>".join(lines)
+
 def render_prisma_diagram(review_id: int) -> None:
     db_settings = settings_repo.get_settings(review_id) or {}
     # Back-fill defaults
@@ -296,12 +368,14 @@ def render_prisma_diagram(review_id: int) -> None:
                 db_settings["_duplicates_removed"] = int(search_db["duplicates_removed"])
 
     counts = article_repo.get_screening_counts(review_id)
+    reason_counts = screening_repo.get_exclusion_reason_counts(review_id)
+    s2_counts = article_repo.get_stage2_counts(review_id)
 
     diag_tab, cust_tab, export_tab = st.tabs(
         ["📊 Diagram", "🎨 Customise", "📥 Export"]
     )
     with diag_tab:
-        _render_diagram_tab(review_id, counts, db_settings, mode_key)
+        _render_diagram_tab(review_id, counts, db_settings, mode_key, reason_counts, s2_counts)
     with cust_tab:
         _render_customisation_panel(review_id, db_settings, mode_key,
                                     db_list_key, add_db_flag)
@@ -311,7 +385,7 @@ def render_prisma_diagram(review_id: int) -> None:
 
 # ── Diagram tab ───────────────────────────────────────────────────────────────
 
-def _render_diagram_tab(review_id, counts, settings, mode_key):
+def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=None, s2_counts=None):
     dark_mode    = st.session_state.get("dark_mode", False)
     current_mode = st.session_state[mode_key]
 
@@ -329,7 +403,7 @@ def _render_diagram_tab(review_id, counts, settings, mode_key):
         st.session_state[mode_key] = new_mode
 
     eff = _effective_settings(settings, st.session_state[mode_key])
-    fig = _build_figure(counts, eff, dark_mode)
+    fig = _build_figure(counts, eff, dark_mode, reason_counts=reason_counts or {}, s2_counts=s2_counts or {})
     st.plotly_chart(fig, use_container_width=True, key=f"prisma_diag_{review_id}")
 
     id_, excl, uns, incl, pend = (
@@ -363,7 +437,11 @@ def _effective_settings(settings: Dict, live_mode: str) -> Dict:
 # FIGURE BUILDER — PAPER COORDINATES, SVG PATH ARROWS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_figure(counts: Dict, settings: Dict, dark_mode: bool) -> go.Figure:
+def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: Dict = None, s2_counts: Dict = None) -> go.Figure:
+    if reason_counts is None:
+        reason_counts = {}
+    if s2_counts is None:
+        s2_counts = {}
     """
     Build the PRISMA 2020 flow diagram entirely in paper coordinates (0–1).
 
@@ -744,25 +822,40 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool) -> go.Figure:
              "screening")
     side_box(y_screen,
              lbl.get("excluded",
-                     f"<b>Records excluded</b><br>"
-                     f"(title/abstract)<br>(n = {excluded:,})"),
+                     _build_excluded_label(excluded, reason_counts)),
              "excluded")
 
     _v_arrow(MAIN_CX, y_screen - BH / 2, y_elig + BH / 2)
 
     # ════════════════════════════════════════════════════════════════════
-    # ELIGIBILITY
+    # ELIGIBILITY — uses Stage 2 counts when available, else Stage 1 proxy
     # ════════════════════════════════════════════════════════════════════
-    elig_n = included + unsure
+    s2_assessed = (s2_counts.get("s2_included", 0) +
+                   s2_counts.get("s2_excluded", 0) +
+                   s2_counts.get("s2_unsure",   0))
+    s2_excl     = s2_counts.get("s2_excluded", 0)
+    has_stage2  = s2_assessed > 0
+
+    # elig_n = articles assessed for eligibility (full-text)
+    # Always show at least the number of Stage-1 included articles
+    if has_stage2:
+        elig_n    = s2_assessed
+        ft_excl_n = s2_excl
+    else:
+        # Stage 2 not started yet — use Stage-1 included as the minimum
+        # (these are the articles that would go to full-text review)
+        elig_n    = max(included + unsure, included, 1) if (included + unsure) > 0 else included
+        ft_excl_n = unsure  # Stage-1 unsure treated as proxy for full-text excluded
+
     main_box(y_elig,
              lbl.get("eligibility",
                      f"<b>Full-text articles assessed</b><br>(n = {elig_n:,})"),
              "eligibility")
 
-    if settings.get("show_unsure_box", True) and unsure > 0:
+    if settings.get("show_unsure_box", True) and ft_excl_n > 0:
         side_box(y_elig,
                  lbl.get("unsure",
-                         f"<b>Full-text excluded</b><br>(n = {unsure:,})"),
+                         f"<b>Full-text excluded</b><br>(n = {ft_excl_n:,})"),
                  "unsure")
 
     _v_arrow(MAIN_CX, y_elig - BH / 2, y_incl + BH / 2)
@@ -770,9 +863,11 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool) -> go.Figure:
     # ════════════════════════════════════════════════════════════════════
     # INCLUDED
     # ════════════════════════════════════════════════════════════════════
+    # Final included count: Stage 2 included if Stage 2 has started
+    final_included = s2_counts.get("s2_included", included) if has_stage2 else included
     main_box(y_incl,
              lbl.get("included",
-                     f"<b>Studies included</b><br>(n = {included:,})"),
+                     f"<b>Studies included</b><br>(n = {final_included:,})"),
              "included")
 
     # ════════════════════════════════════════════════════════════════════
@@ -929,21 +1024,21 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
     with st.expander("📐 Layout, Spacing & Arrows", expanded=False):
         st.markdown("**Box dimensions** (paper coordinates 0–1)")
         r1c1, r1c2, r1c3 = st.columns(3)
-        new_bw_  = r1c1.slider("Main box width",  0.00, 1.00, new_bw_,  0.01, key=f"sl_bw_{rid}")
-        new_bh_  = r1c2.slider("Box height",      0.00, 0.60, new_bh_,  0.01, key=f"sl_bh_{rid}")
-        new_sbw_ = r1c3.slider("Side box width",  0.00, 0.60, new_sbw_, 0.01, key=f"sl_sbw_{rid}")
+        new_bw_  = r1c1.slider("Main box width",  0.20, 0.55, new_bw_,  0.01, key=f"sl_bw_{rid}")
+        new_bh_  = r1c2.slider("Box height",      0.04, 0.18, new_bh_,  0.01, key=f"sl_bh_{rid}")
+        new_sbw_ = r1c3.slider("Side box width",  0.10, 0.40, new_sbw_, 0.01, key=f"sl_sbw_{rid}")
         st.markdown("**Spacing**")
         r2c1, r2c2 = st.columns(2)
-        new_vg_ = r2c1.slider("Vertical gap between boxes", 0.00, 0.60, new_vg_, 0.01, key=f"sl_vg_{rid}",
+        new_vg_ = r2c1.slider("Vertical gap between boxes", 0.04, 0.28, new_vg_, 0.01, key=f"sl_vg_{rid}",
                                help="Gap between bottom of one box and top of next.")
-        new_hg_ = r2c2.slider("Horizontal gap (main→side)", 0.00, 0.60, new_hg_, 0.01, key=f"sl_hg_{rid}",
+        new_hg_ = r2c2.slider("Horizontal gap (main→side)", 0.01, 0.20, new_hg_, 0.01, key=f"sl_hg_{rid}",
                                help="Gap between right edge of main box and left edge of side box.")
         st.markdown("**Stage label position**")
-        new_lx_ = st.slider("Stage label column X", 0.00, 0.60, new_lx_, 0.005, key=f"sl_lx_{rid}",
+        new_lx_ = st.slider("Stage label column X", 0.01, 0.12, new_lx_, 0.005, key=f"sl_lx_{rid}",
                              help="Horizontal position of the Identification/Screening/... labels.")
         st.markdown("**Arrows**")
         r3c1, r3c2 = st.columns(2)
-        new_aw_      = r3c1.slider("Arrow width (px)", 1, 10, new_aw_, key=f"sl_aw_{rid}")
+        new_aw_      = r3c1.slider("Arrow width (px)", 1, 5, new_aw_, key=f"sl_aw_{rid}")
         new_show_uns = r3c2.checkbox("Show unsure/full-text exclusion box",
                                      value=new_show_uns, key=f"cb_uns_{rid}")
 
@@ -951,12 +1046,12 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
     with st.expander("🔤 Typography", expanded=False):
         st.markdown("**Box text**")
         tc1, tc2 = st.columns(2)
-        new_fs_ = tc1.slider("Font size", 1, 30, new_fs_, key=f"sl_fs_{rid}")
+        new_fs_ = tc1.slider("Font size", 8, 18, new_fs_, key=f"sl_fs_{rid}")
         ff_idx  = FONT_FAMILIES.index(new_ff_) if new_ff_ in FONT_FAMILIES else 0
         new_ff_ = tc2.selectbox("Font family", FONT_FAMILIES, index=ff_idx, key=f"sel_ff_{rid}")
         st.markdown("**Stage labels**")
         lc1, lc2 = st.columns(2)
-        new_lfs_ = lc1.slider("Label font size", 1, 30, new_lfs_, key=f"sl_lfs_{rid}")
+        new_lfs_ = lc1.slider("Label font size", 6, 16, new_lfs_, key=f"sl_lfs_{rid}")
         lff_idx  = FONT_FAMILIES.index(new_lff_) if new_lff_ in FONT_FAMILIES else 0
         new_lff_ = lc2.selectbox("Label font family", FONT_FAMILIES, index=lff_idx, key=f"sel_lff_{rid}")
 
@@ -1068,8 +1163,11 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
     st.markdown("#### 👁️ Live Preview")
     st.caption("All changes reflected instantly. Click **Apply Changes** to save.")
     counts  = article_repo.get_screening_counts(review_id)
+    reason_counts_pre = screening_repo.get_exclusion_reason_counts(review_id)
+    s2_counts_pre = article_repo.get_stage2_counts(review_id)
     eff     = _effective_settings(preview, st.session_state.get(mode_key, "colour"))
-    fig_pre = _build_figure(counts, eff, st.session_state.get("dark_mode", False))
+    fig_pre = _build_figure(counts, eff, st.session_state.get("dark_mode", False),
+                            reason_counts=reason_counts_pre, s2_counts=s2_counts_pre)
     st.plotly_chart(fig_pre, use_container_width=True, key=f"prisma_preview_{review_id}")
 
     b1, b2 = st.columns(2)
@@ -1172,15 +1270,3 @@ def _render_export_panel(review_id, settings, counts):
                 st.error(f"Import failed: {e}")
     with st.expander("Current settings (JSON)", expanded=False):
         st.json(settings)
-
-
-
-
-
-
-
-
-
-
-
-
