@@ -82,6 +82,9 @@ class StudyData:
     follow_up_duration: str = _NR
     primary_outcome: str = _NR
     primary_outcome_result: str = _NR
+    # Per-arm event counts for SoF table absolute effect calculation
+    events_intervention: str = _NR   # e.g. "19/266 (7.1%)"
+    events_comparator:   str = _NR   # e.g. "44/359 (12.3%)"
     secondary_outcomes: List[str] = field(default_factory=list)
     adverse_events: str = _NR
     statistical_significance: str = _NR
@@ -103,6 +106,8 @@ class StudyData:
             "Follow-up":          self.follow_up_duration,
             "Primary Outcome":    self.primary_outcome,
             "Primary Result":     self.primary_outcome_result,
+            "Events (intervention)": self.events_intervention,
+            "Events (comparator)":   self.events_comparator,
             "Secondary Outcomes": sec,
             "Adverse Events":     self.adverse_events,
             "Significance":       self.statistical_significance,
@@ -247,6 +252,8 @@ def _parse_study_data(text: str, pmid: str, title: str) -> StudyData:
         follow_up_duration=  _val("follow_up_duration"),
         primary_outcome=     _val("primary_outcome"),
         primary_outcome_result= _val("primary_outcome_result"),
+        events_intervention=     _val("events_intervention"),
+        events_comparator=       _val("events_comparator"),
         secondary_outcomes=  _list_val("secondary_outcomes"),
         adverse_events=      _val("adverse_events"),
         statistical_significance= _val("statistical_significance"),

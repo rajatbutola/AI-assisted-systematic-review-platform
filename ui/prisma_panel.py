@@ -310,11 +310,15 @@ _REASON_LABELS = {
     "other":              "Other",
 }
 
-def _build_excluded_label(n_excluded: int, reason_counts: dict) -> str:
-    """Build the PRISMA excluded box label with reason breakdown."""
-    lines = [f"<b>Records excluded</b>", f"(title/abstract)", f"(n = {n_excluded:,})"]
+def _build_excluded_label(n_excluded: int, reason_counts: dict,
+                          stage_label: str = "title/abstract") -> str:
+    """Build the PRISMA excluded box label with reason breakdown.
+    No inline font-size — let _build_figure's FS setting control sizing.
+    """
+    lines = ["<b>Records excluded</b>",
+             f"({stage_label})",
+             f"(n = {n_excluded:,})"]
     if reason_counts:
-        # Sort by count descending, show top 6
         top = sorted(reason_counts.items(), key=lambda x: -x[1])[:6]
         for tag, count in top:
             label = _REASON_LABELS.get(tag, tag.replace("_", " ").title())
@@ -368,14 +372,16 @@ def render_prisma_diagram(review_id: int) -> None:
                 db_settings["_duplicates_removed"] = int(search_db["duplicates_removed"])
 
     counts = article_repo.get_screening_counts(review_id)
-    reason_counts = screening_repo.get_exclusion_reason_counts(review_id)
-    s2_counts = article_repo.get_stage2_counts(review_id)
+    reason_counts    = screening_repo.get_exclusion_reason_counts(review_id, "title_abstract")
+    s2_reason_counts = screening_repo.get_exclusion_reason_counts(review_id, "full_text")
+    s2_counts        = article_repo.get_stage2_counts(review_id)
+
 
     diag_tab, cust_tab, export_tab = st.tabs(
         ["📊 Diagram", "🎨 Customise", "📥 Export"]
     )
     with diag_tab:
-        _render_diagram_tab(review_id, counts, db_settings, mode_key, reason_counts, s2_counts)
+        _render_diagram_tab(review_id, counts, db_settings, mode_key, reason_counts, s2_counts, s2_reason_counts)
     with cust_tab:
         _render_customisation_panel(review_id, db_settings, mode_key,
                                     db_list_key, add_db_flag)
@@ -385,7 +391,7 @@ def render_prisma_diagram(review_id: int) -> None:
 
 # ── Diagram tab ───────────────────────────────────────────────────────────────
 
-def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=None, s2_counts=None):
+def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=None, s2_counts=None, s2_reason_counts=None):
     dark_mode    = st.session_state.get("dark_mode", False)
     current_mode = st.session_state[mode_key]
 
@@ -403,7 +409,8 @@ def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=Non
         st.session_state[mode_key] = new_mode
 
     eff = _effective_settings(settings, st.session_state[mode_key])
-    fig = _build_figure(counts, eff, dark_mode, reason_counts=reason_counts or {}, s2_counts=s2_counts or {})
+    fig = _build_figure(counts, eff, dark_mode, reason_counts=reason_counts or {}, s2_counts=s2_counts or {},
+                        s2_reason_counts=s2_reason_counts or {})
     st.plotly_chart(fig, use_container_width=True, key=f"prisma_diag_{review_id}")
 
     id_, excl, uns, incl, pend = (
@@ -437,11 +444,13 @@ def _effective_settings(settings: Dict, live_mode: str) -> Dict:
 # FIGURE BUILDER — PAPER COORDINATES, SVG PATH ARROWS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: Dict = None, s2_counts: Dict = None) -> go.Figure:
+def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: Dict = None, s2_counts: Dict = None, s2_reason_counts: Dict = None) -> go.Figure:
     if reason_counts is None:
         reason_counts = {}
     if s2_counts is None:
         s2_counts = {}
+    if s2_reason_counts is None:
+        s2_reason_counts = {}
     """
     Build the PRISMA 2020 flow diagram entirely in paper coordinates (0–1).
 
@@ -454,7 +463,15 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     SVG M (moveto) and L (lineto) commands plus a custom arrowhead shape.
     This guarantees pixel-perfect alignment regardless of figure size.
     """
-    identified = counts["total"]
+    # identified = raw total across all sources BEFORE deduplication
+    # counts["total"] = unique articles in DB (post-dedup) — used for screened/included
+    _databases = settings.get("databases", [])
+    _raw_total = sum(int(db.get("n", 0)) for db in _databases if isinstance(db, dict))
+    _dupes_n   = int(settings.get("_duplicates_removed", 0))
+    # If we have source-level data, identified = sum of sources (pre-dedup)
+    # Otherwise fall back to counts["total"] (already in DB, post-dedup)
+    identified = _raw_total if _raw_total > 0 else counts["total"]
+
     excluded   = counts["excluded"]
     unsure     = counts["unsure"]
     included   = counts["included"]
@@ -497,8 +514,22 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     AW   = int(settings.get("arrow_width",        2))
     LX   = float(settings.get("label_col_x",     0.04))  # x-centre of stage label column
 
+    # Per-box size overrides (set in customisation panel)
+    _box_sizes = settings.get("box_sizes", {})
+
+    def _bw(key): return float(_box_sizes.get(key, {}).get("w", BW))
+    def _bh(key): return float(_box_sizes.get(key, {}).get("h", BH))
+
+    # Per-pair gap overrides
+    _h_gaps = settings.get("h_gaps", {})
+    _v_gaps = settings.get("v_gaps", {})
+
+    def _hg(key): return float(_h_gaps.get(key, HG)) if _h_gaps.get(key, 0) > 0 else HG
+    def _vg(key): return float(_v_gaps.get(key, VG)) if _v_gaps.get(key, 0) > 0 else VG
+
     # Margin for top/bottom padding
     TOP_PAD = 0.04
+
     databases = settings.get("databases", [])
     other_n   = int(settings.get("additional_sources_n", 0))
     dupes_from_search = int(settings.get("_duplicates_removed", 0))
@@ -513,14 +544,14 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     # We'll compute from the top down:
     # y = 1 - TOP_PAD - BH/2 is the centre of the topmost row
     if n_src >= 2:
-        y_src_row   = 1 - TOP_PAD - BH / 2                  # source boxes
-        y_ident     = y_src_row - BH - VG                    # identification (after dedup)
+        y_src_row = 1 - TOP_PAD - BH / 2
+        y_ident   = y_src_row - BH - _vg("src_ident_vg")
     else:
-        y_ident     = 1 - TOP_PAD - BH / 2
+        y_ident   = 1 - TOP_PAD - BH / 2
 
-    y_screen = y_ident  - BH - VG
-    y_elig   = y_screen - BH - VG
-    y_incl   = y_elig   - BH - VG
+    y_screen = y_ident  - BH - _vg("ident_screen_vg")
+    y_elig   = y_screen - BH - _vg("screen_elig_vg")
+    y_incl   = y_elig   - BH - _vg("elig_incl_vg")
 
     # X positions
     MAIN_CX  = 0.50              # centre of main column
@@ -568,13 +599,14 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
         txt_size = size or FS
 
         if box_h is not None:
-            # Estimate available pixel height for this box
-            # figure is ~650px tall, paper coords are 0-1
             px_height = 650 * box_h
-            n_lines = max(1, text.count("<br>") + 1)
-            # Each line needs ~font_size * 1.4 px; cap so all lines fit
-            max_size_from_height = max(6, int(px_height / (n_lines * 1.5)))
-            txt_size = min(txt_size, max_size_from_height)
+            n_lines   = max(1, text.count("<br>") + 1)
+            # Only auto-cap for boxes with few structural lines (≤3).
+            # Reason-breakdown boxes have many lines — their box height
+            # is already sized to fit them; the user's FS setting controls size.
+            if n_lines <= 3:
+                max_size_from_height = max(6, int(px_height / (n_lines * 1.5)))
+                txt_size = min(txt_size, max_size_from_height)
 
         fig.add_annotation(
             xref="paper", yref="paper",
@@ -672,25 +704,26 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
                            f"L {cx_dest} {y_dest_top} Z",
                       fillcolor=arrow_c, line=dict(color=arrow_c, width=0))
 
-    def main_box(cy, text, color_key, w=None):
+    def main_box(cy, text, color_key, w=None, h=None):
         w = w or BW
+        h = h or BH
         fill = bc.get(color_key, _COLOUR_BOXES.get(color_key, "#1B4F8A"))
         font = fc.get(color_key, "#FFFFFF")
-        _box(MAIN_CX, cy, w, BH, fill)
-        _text(MAIN_CX, cy, text, font, box_w=w, box_h=BH)
+        _box(MAIN_CX, cy, w, h, fill)
+        _text(MAIN_CX, cy, text, font, box_w=w, box_h=h)
 
-    def side_box(cy, text, color_key, w=None):
-        w = w or SBW
+    def side_box(cy, text, color_key, w=None, h=None, hg=None):
+        w   = w or SBW
+        h   = h or BH
+        hg_ = hg if hg is not None else HG
+        scx = MAIN_CX + BW / 2 + hg_ + w / 2
+        scx = min(scx, 0.97 - w / 2)
         fill = bc.get(color_key, _COLOUR_BOXES.get(color_key, "#8B2500"))
         font = fc.get(color_key, "#FFFFFF")
-        _box(SIDE_CX, cy, w, BH, fill)
-        _text(SIDE_CX, cy, text, font, box_w=w, box_h=BH)
-        # Arrow from main box right edge to side box left edge
-        _h_arrow(
-            y=cy,
-            x_from_right_edge=MAIN_CX + BW / 2,
-            x_to_left_edge=SIDE_CX - w / 2,
-        )
+        _box(scx, cy, w, h, fill)
+        _text(scx, cy, text, font, box_w=w, box_h=h)
+        _h_arrow(y=cy, x_from_right_edge=MAIN_CX + BW / 2,
+                 x_to_left_edge=scx - w / 2)
 
     # ════════════════════════════════════════════════════════════════════
     # STAGE LABEL BARS (left side, vertical text)
@@ -749,7 +782,7 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     # ════════════════════════════════════════════════════════════════════
     # IDENTIFICATION ROW
     # ════════════════════════════════════════════════════════════════════
-    dupes_n = dupes_from_search if dupes_from_search > 0 else max(0, identified - screened)
+    dupes_n = dupes_from_search if dupes_from_search > 0 else max(0, _dupes_n) if _dupes_n > 0 else max(0, identified - counts["total"])
 
     if n_src >= 2:
         # ── Multi-source: side-by-side source boxes at the top ─────────
@@ -771,19 +804,20 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
 
         # Dedup box (main column, between source row and screening row)
         total_all = sum(db["n"] for db in databases) + other_n
-        after_dedup = max(0, total_all - dupes_n)
+        after_dedup = counts["total"]
         main_box(y_ident,
                  lbl.get("identification",
                          f"<b>Records after deduplication</b>"
                          f"<br>(n = {after_dedup:,})"),
-                 "identification")
+                 "identification", w=_bw("identification"), h=_bh("identification"))
 
         # Side box: duplicates removed
         side_box(y_ident,
                  lbl.get("duplicates",
                          f"<b>Duplicates removed</b><br>(n = {dupes_n:,})"),
-                 "duplicates")
-
+                 "duplicates", w=_bw("duplicates"), h=_bh("duplicates"),
+                 hg=_hg("ident_hg"))
+        
         # Arrows: each source box → dedup box (merge arrows)
         for sx in x_starts[:n]:
             _merge_arrow(sx, y_src_row - BH / 2, MAIN_CX, y_ident + BH / 2)
@@ -804,11 +838,13 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
             ident_txt = lbl.get("identification",
                 f"<b>Records identified</b><br>(n = {identified:,})")
 
-        main_box(y_ident, ident_txt, "identification")
+        main_box(y_ident, ident_txt, "identification",
+                 w=_bw("identification"), h=_bh("identification"))
         side_box(y_ident,
                  lbl.get("duplicates",
                          f"<b>Duplicates removed</b><br>(n = {dupes_n:,})"),
-                 "duplicates")
+                 "duplicates", w=_bw("duplicates"), h=_bh("duplicates"),
+                 hg=_hg("ident_hg"))
 
     # Vertical arrow from identification to screening
     _v_arrow(MAIN_CX, y_ident - BH / 2, y_screen + BH / 2)
@@ -819,11 +855,13 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     main_box(y_screen,
              lbl.get("screening",
                      f"<b>Records screened</b><br>(n = {screened:,})"),
-             "screening")
+             "screening", w=_bw("screening"), h=_bh("screening"))
+
     side_box(y_screen,
              lbl.get("excluded",
                      _build_excluded_label(excluded, reason_counts)),
-             "excluded")
+             "excluded", w=_bw("excluded"), h=_bh("excluded"),
+             hg=_hg("screen_hg"))
 
     _v_arrow(MAIN_CX, y_screen - BH / 2, y_elig + BH / 2)
 
@@ -842,21 +880,23 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
         elig_n    = s2_assessed
         ft_excl_n = s2_excl
     else:
-        # Stage 2 not started yet — use Stage-1 included as the minimum
-        # (these are the articles that would go to full-text review)
-        elig_n    = max(included + unsure, included, 1) if (included + unsure) > 0 else included
-        ft_excl_n = unsure  # Stage-1 unsure treated as proxy for full-text excluded
+        # Stage 2 not started — show Stage 1 included as "awaiting full-text review"
+        # Do NOT use unsure as a proxy — it distorts the diagram
+        elig_n    = included   # only articles that actually passed Stage 1
+        ft_excl_n = 0          # no full-text exclusions yet
 
     main_box(y_elig,
              lbl.get("eligibility",
                      f"<b>Full-text articles assessed</b><br>(n = {elig_n:,})"),
-             "eligibility")
+             "eligibility", w=_bw("eligibility"), h=_bh("eligibility"))
 
     if settings.get("show_unsure_box", True) and ft_excl_n > 0:
         side_box(y_elig,
                  lbl.get("unsure",
-                         f"<b>Full-text excluded</b><br>(n = {ft_excl_n:,})"),
-                 "unsure")
+                         _build_excluded_label(ft_excl_n, s2_reason_counts,
+                                               stage_label="full-text")),
+                 "unsure", w=_bw("unsure"), h=_bh("unsure"),
+                 hg=_hg("elig_hg"))
 
     _v_arrow(MAIN_CX, y_elig - BH / 2, y_incl + BH / 2)
 
@@ -868,7 +908,7 @@ def _build_figure(counts: Dict, settings: Dict, dark_mode: bool, reason_counts: 
     main_box(y_incl,
              lbl.get("included",
                      f"<b>Studies included</b><br>(n = {final_included:,})"),
-             "included")
+             "included", w=_bw("included"), h=_bh("included"))
 
     # ════════════════════════════════════════════════════════════════════
     # EXTRA CUSTOM BOX
@@ -1041,6 +1081,93 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
         new_aw_      = r3c1.slider("Arrow width (px)", 1, 5, new_aw_, key=f"sl_aw_{rid}")
         new_show_uns = r3c2.checkbox("Show unsure/full-text exclusion box",
                                      value=new_show_uns, key=f"cb_uns_{rid}")
+    # ── 3b. Per-Box Size Overrides ─────────────────────────────────────
+    with st.expander("📦 Per-Box Size & Spacing Overrides", expanded=False):
+        st.caption(
+            "Override width/height for individual boxes. "
+            "Leave W and H at 0 to use the global setting above."
+        )
+        _box_sizes_cur = settings.get("box_sizes", {})
+        _BOX_KEYS_SIZES = [
+            ("identification", "Records after deduplication (main)"),
+            ("screening",      "Records Screened (main)"),
+            ("eligibility",    "Full-text Assessed (main)"),
+            ("included",       "Studies Included (main)"),
+            ("excluded",       "Records Excluded (side)"),
+            ("unsure",         "Full-text Excluded (side)"),
+            ("duplicates",     "Duplicates Removed (side)"),
+        ]
+        # Header row
+        hc1, hc2, hc3 = st.columns([2, 1, 1])
+        hc1.caption("**Box**")
+        hc2.caption("**Width**")
+        hc3.caption("**Height**")
+
+        new_box_sizes = {}
+        for bkey, blabel in _BOX_KEYS_SIZES:
+            cur = _box_sizes_cur.get(bkey, {})
+            bc1, bc2, bc3 = st.columns([2, 1, 1])
+            bc1.markdown(f"{blabel}")
+            _ow = bc2.number_input(f"W_{bkey}", min_value=0.0, max_value=0.9,
+                                   value=float(cur.get("w", 0.0)), step=0.01,
+                                   key=f"bsz_w_{rid}_{bkey}",
+                                   label_visibility="collapsed",
+                                   help="0 = use global width")
+            _oh = bc3.number_input(f"H_{bkey}", min_value=0.0, max_value=0.5,
+                                   value=float(cur.get("h", 0.0)), step=0.01,
+                                   key=f"bsz_h_{rid}_{bkey}",
+                                   label_visibility="collapsed",
+                                   help="0 = use global height")
+            entry = {}
+            if _ow > 0: entry["w"] = _ow
+            if _oh > 0: entry["h"] = _oh
+            if entry:
+                new_box_sizes[bkey] = entry
+
+        st.divider()
+        st.markdown("**Per-pair horizontal gap** (main box → side box)")
+        st.caption("Overrides the global horizontal gap for specific rows. 0 = use global.")
+        _hgaps_cur = settings.get("h_gaps", {})
+        _HGAP_PAIRS = [
+            ("ident_hg",   "Deduplication row  (main → Duplicates Removed)"),
+            ("screen_hg",  "Screening row      (main → Records Excluded)"),
+            ("elig_hg",    "Eligibility row    (main → Full-text Excluded)"),
+        ]
+        new_h_gaps = {}
+        for gkey, glabel in _HGAP_PAIRS:
+            cur_g = _hgaps_cur.get(gkey, 0.0)
+            gc1, gc2 = st.columns([3, 1])
+            gc1.markdown(glabel)
+            _og = gc2.number_input(f"HG_{gkey}", min_value=0.0, max_value=0.5,
+                                   value=float(cur_g), step=0.01,
+                                   key=f"hgap_{rid}_{gkey}",
+                                   label_visibility="collapsed",
+                                   help="0 = use global h_gap")
+            if _og > 0:
+                new_h_gaps[gkey] = _og
+
+        st.divider()
+        st.markdown("**Per-pair vertical gap** (between specific box pairs)")
+        st.caption("Overrides the global vertical gap for specific transitions. 0 = use global.")
+        _vgaps_cur = settings.get("v_gaps", {})
+        _VGAP_PAIRS = [
+            ("src_ident_vg",  "Source boxes → Records after deduplication"),
+            ("ident_screen_vg","Deduplication → Records Screened"),
+            ("screen_elig_vg", "Records Screened → Full-text Assessed"),
+            ("elig_incl_vg",   "Full-text Assessed → Studies Included"),
+        ]
+        new_v_gaps = {}
+        for vkey, vlabel in _VGAP_PAIRS:
+            cur_v = _vgaps_cur.get(vkey, 0.0)
+            vc1, vc2 = st.columns([3, 1])
+            vc1.markdown(vlabel)
+            _ov = vc2.number_input(f"VG_{vkey}", min_value=0.0, max_value=0.5,
+                                   value=float(cur_v), step=0.01,
+                                   key=f"vgap_{rid}_{vkey}",
+                                   label_visibility="collapsed",
+                                   help="0 = use global v_gap")
+            if _ov > 0:
+                new_v_gaps[vkey] = _ov
 
     # ── 4. Typography ──────────────────────────────────────────────────
     with st.expander("🔤 Typography", expanded=False):
@@ -1150,6 +1277,9 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
         "font_family":          new_ff_,  "label_font_size": new_lfs_,
         "label_font_family":    new_lff_, "label_col_x":    new_lx_,
         "show_unsure_box":      new_show_uns,
+        "box_sizes":            new_box_sizes,
+        "h_gaps":               new_h_gaps,
+        "v_gaps":               new_v_gaps,
         "custom_labels":        new_labels,
         "databases":            effective_dbs,
         "additional_sources_n": new_other_n,
@@ -1163,11 +1293,14 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
     st.markdown("#### 👁️ Live Preview")
     st.caption("All changes reflected instantly. Click **Apply Changes** to save.")
     counts  = article_repo.get_screening_counts(review_id)
-    reason_counts_pre = screening_repo.get_exclusion_reason_counts(review_id)
-    s2_counts_pre = article_repo.get_stage2_counts(review_id)
+    reason_counts_pre    = screening_repo.get_exclusion_reason_counts(review_id, "title_abstract")
+    s2_reason_counts_pre = screening_repo.get_exclusion_reason_counts(review_id, "full_text")
+    s2_counts_pre        = article_repo.get_stage2_counts(review_id)
     eff     = _effective_settings(preview, st.session_state.get(mode_key, "colour"))
     fig_pre = _build_figure(counts, eff, st.session_state.get("dark_mode", False),
-                            reason_counts=reason_counts_pre, s2_counts=s2_counts_pre)
+                            reason_counts=reason_counts_pre,
+                            s2_counts=s2_counts_pre,
+                            s2_reason_counts=s2_reason_counts_pre)
     st.plotly_chart(fig_pre, use_container_width=True, key=f"prisma_preview_{review_id}")
 
     b1, b2 = st.columns(2)
@@ -1270,3 +1403,4 @@ def _render_export_panel(review_id, settings, counts):
                 st.error(f"Import failed: {e}")
     with st.expander("Current settings (JSON)", expanded=False):
         st.json(settings)
+

@@ -269,7 +269,7 @@ def get_registry(_version=7):
 registry = get_registry()
 
 st.set_page_config(
-    page_title="SciSynth — AI Systematic Review",
+    page_title="SR/MA — AI Assisted SR/MA Platform",
     page_icon="🔭",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1002,7 +1002,13 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
     from config.settings import CORE_API_KEY as _CORE_KEY
     _core_options = ["PubMed","Europe PMC","CORE"] if _CORE_KEY else ["PubMed","Europe PMC"]
 
-    source_name = st.selectbox("Data Source", options=_core_options, key="medical_source_select")
+    _src_key_ss  = f"medical_source_{review_id}"
+    _src_default = st.session_state.get(_src_key_ss, _core_options[0])
+    _src_idx     = _core_options.index(_src_default) if _src_default in _core_options else 0
+    source_name  = st.selectbox("Data Source", options=_core_options,
+                                index=_src_idx,
+                                key=f"medical_source_select_{review_id}")
+    st.session_state[_src_key_ss] = source_name
 
     from config.settings import UMLS_API_KEY as _UMLS_KEY
     _umls_available = bool(_UMLS_KEY)
@@ -1013,23 +1019,54 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         use_umls = False
         st.info("💡 **UMLS expansion not active.** Add `UMLS_API_KEY` to your `.env`.")
 
+    # Restore saved form values for this review (persist across tab switches)
+    _fk = f"pico_form_{review_id}"  # namespace per review
+    _saved = st.session_state.get(_fk, {})
+    _st_keys = list(STUDY_TYPE_FILTERS.keys())
+
     with st.form("pico_form"):
-        population   = st.text_input("Population",   placeholder="e.g. adults with CLL")
-        intervention = st.text_input("Intervention", placeholder="e.g. venetoclax")
-        comparison   = st.text_input("Comparison (optional)", placeholder="e.g. ibrutinib")
-        outcome      = st.text_input("Outcome",      placeholder="e.g. overall survival")
+        population   = st.text_input("Population",
+                           value=_saved.get("population", ""),
+                           placeholder="e.g. adults with CLL")
+        intervention = st.text_input("Intervention",
+                           value=_saved.get("intervention", ""),
+                           placeholder="e.g. venetoclax")
+        comparison   = st.text_input("Comparison (optional)",
+                           value=_saved.get("comparison", ""),
+                           placeholder="e.g. ibrutinib")
+        outcome      = st.text_input("Outcome",
+                           value=_saved.get("outcome", ""),
+                           placeholder="e.g. overall survival")
         col1, col2, col3 = st.columns(3)
-        year_from    = col1.number_input("Year From", 1900, 2100, 2015)
-        year_to      = col2.number_input("Year To",   1900, 2100, 2025)
-        max_results  = col3.slider("Max Results", 1, 200, 20)
-        study_type   = st.radio("Study Type Filter", options=list(STUDY_TYPE_FILTERS.keys()),
-                                index=0, horizontal=True)
+        year_from    = col1.number_input("Year From", 1900, 2100,
+                           _saved.get("year_from", 2015))
+        year_to      = col2.number_input("Year To",   1900, 2100,
+                           _saved.get("year_to", 2025))
+        max_results  = col3.slider("Max Results", 1, 200,
+                           _saved.get("max_results", 20))
+        _st_saved_idx = _st_keys.index(_saved["study_type"]) \
+                        if _saved.get("study_type") in _st_keys else 0
+        study_type   = st.radio("Study Type Filter",
+                           options=_st_keys,
+                           index=_st_saved_idx,
+                           horizontal=True)
         submitted    = st.form_submit_button(f"🔍 Search {source_name}", type="primary")
 
     pending_key = f"pico_pending_{review_id}"
     pending     = st.session_state.get(pending_key, {})
 
     if submitted:
+        # Persist form values so they survive tab switches
+        st.session_state[_fk] = {
+            "population":   population,
+            "intervention": intervention,
+            "comparison":   comparison,
+            "outcome":      outcome,
+            "year_from":    year_from,
+            "year_to":      year_to,
+            "max_results":  max_results,
+            "study_type":   study_type,
+        }
         new_fp        = _pico_fingerprint(population, intervention, comparison,
                                           outcome, year_from, year_to, study_type)
         pico_changed  = _check_pico_change(review_id, new_fp)
@@ -1101,24 +1138,42 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
 
     n_searched = sum(1 for x in [pubmed_articles, epmc_articles, core_articles] if x)
     if n_searched > 1:
-        combined, n_dupes = _deduplicate(pubmed_articles, epmc_articles, core_articles)
-        _store(review_id, "n_duplicates_removed", n_dupes)
+        # Use DB-level counts (source_totals) for accurate per-source numbers.
+        # These reflect actual unique articles in DB, not raw session results.
         _refresh_prisma_from_db(review_id)
-        db_total = counts["total"]
+        db_total      = counts["total"]
+        src_totals    = search_repo.get_source_totals(review_id)
+        n_raw_all     = sum(src_totals.values())
+        n_dupes_db    = max(0, n_raw_all - db_total)
+        _store(review_id, "n_duplicates_removed", n_dupes_db)
+        _refresh_prisma_from_db(review_id)
+
         parts = []
-        if pubmed_articles: parts.append(f"PubMed: **{len(pubmed_articles)}**")
-        if epmc_articles:   parts.append(f"Europe PMC: **{len(epmc_articles)}**")
-        if core_articles:   parts.append(f"CORE: **{len(core_articles)}**")
-        n_raw = sum(len(x) for x in [pubmed_articles, epmc_articles, core_articles] if x)
-        parts.append(f"Duplicates removed: **{n_raw - db_total}**")
+        for src_name in ["PubMed", "Europe PMC", "CORE",
+                         "Semantic Scholar", "OpenAlex"]:
+            n = src_totals.get(src_name, 0)
+            if n > 0:
+                parts.append(f"{src_name}: **{n}**")
+        parts.append(f"Duplicates removed: **{n_dupes_db}**")
         parts.append(f"Unique in DB: **{db_total}**")
         st.info("📊 **Multi-source:** " + " | ".join(parts))
 
+    # Use DB counts for tab labels so they match the banner and PRISMA
+    _src_totals_tabs = search_repo.get_source_totals(review_id)
     tab_labels = []
     tab_data   = []
-    if pubmed_articles: tab_labels.append(f"📘 PubMed ({len(pubmed_articles)})");   tab_data.append(pubmed_articles)
-    if epmc_articles:   tab_labels.append(f"📗 Europe PMC ({len(epmc_articles)})"); tab_data.append(epmc_articles)
-    if core_articles:   tab_labels.append(f"🟠 CORE ({len(core_articles)})");       tab_data.append(core_articles)
+    if pubmed_articles:
+        _n = _src_totals_tabs.get("PubMed", len(pubmed_articles))
+        tab_labels.append(f"📘 PubMed ({_n})")
+        tab_data.append(pubmed_articles)
+    if epmc_articles:
+        _n = _src_totals_tabs.get("Europe PMC", len(epmc_articles))
+        tab_labels.append(f"📗 Europe PMC ({_n})")
+        tab_data.append(epmc_articles)
+    if core_articles:
+        _n = _src_totals_tabs.get("CORE", len(core_articles))
+        tab_labels.append(f"🟠 CORE ({_n})")
+        tab_data.append(core_articles)
     tab_labels.append("📄 Full Texts")
 
     tabs_out     = st.tabs(tab_labels)
@@ -1481,6 +1536,7 @@ def _render_ml_form(review_id, registry, search_repo, article_repo):
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
+
     st.markdown("""
     <div style="padding:1.25rem 1rem 1rem;display:flex;align-items:center;gap:0.6rem;">
         <div style="width:28px;height:28px;background:#C9974C;border-radius:6px;
@@ -1488,7 +1544,7 @@ with st.sidebar:
                     font-size:14px;flex-shrink:0;">🔭</div>
         <div>
             <div style="font-size:0.9rem;font-weight:600;color:#fff;letter-spacing:-0.01em;">
-                SciSynth</div>
+                SR/MA</div>
             <div style="font-size:0.65rem;color:rgba(255,255,255,0.4);
                         text-transform:uppercase;letter-spacing:0.08em;margin-top:1px;">
                 AI Systematic Review</div>
@@ -1551,7 +1607,7 @@ with st.sidebar:
     st.markdown("""<div style="position:absolute;bottom:1rem;left:0;right:0;
         padding:0.75rem 1rem 0;border-top:1px solid rgba(255,255,255,0.07);">
         <div style="font-size:0.68rem;color:rgba(255,255,255,0.2);text-align:center;">
-            SciSynth v7 · AI-Assisted SR</div>
+            SR/MA · AI-Assisted Platform</div>
     </div>""", unsafe_allow_html=True)
 
 
@@ -1568,20 +1624,43 @@ review = review_repo.get_review(review_id)
 counts = article_repo.get_screening_counts(review_id)
 s2_counts = article_repo.get_stage2_counts(review_id)
 
-# Persistent state: on review switch, refresh PRISMA counts and store DB article counts
+# Persistent state: restore all article data from DB on every load.
+# This ensures search results are always visible after page reload or review switch.
+# _af() in _render_article_cards handles both Article objects and dicts safely.
 _last_review_key = "last_active_review_id"
-if st.session_state.get(_last_review_key) != review_id:
+_review_switched = st.session_state.get(_last_review_key) != review_id
+if _review_switched:
     st.session_state[_last_review_key] = review_id
     _refresh_prisma_from_db(review_id)
-    # Cache article counts per source for the Search tab banner
-    _all_db = article_repo.get_articles_for_review(review_id)
-    _src_map = {"pubmed":"PubMed","europe_pmc":"Europe PMC","core":"CORE",
-                "semantic_scholar":"Semantic Scholar","openalex":"OpenAlex"}
-    _db_cnts: Dict[str, int] = {}
-    for _a in _all_db:
-        _d = _src_map.get((_a.get("source") or "").lower(), "Other")
-        _db_cnts[_d] = _db_cnts.get(_d, 0) + 1
-    _store(review_id, "db_article_counts", _db_cnts)
+
+# Always restore articles from DB if session_state slots are empty.
+# Runs on every page load — cheap because it's a single indexed DB query.
+_src_map = {"pubmed": "PubMed", "europe_pmc": "Europe PMC", "core": "CORE",
+            "semantic_scholar": "Semantic Scholar", "openalex": "OpenAlex"}
+_all_db  = article_repo.get_articles_for_review(review_id)
+_by_src: Dict[str, list] = {}
+for _a in _all_db:
+    _src_key = (_a.get("source") or "").lower()
+    _display = _src_map.get(_src_key, _src_key.upper())
+    _by_src.setdefault(_display, []).append(_a)
+
+# Store counts always (for banner / metrics)
+_db_cnts: Dict[str, int] = {s: len(arts) for s, arts in _by_src.items()}
+_store(review_id, "db_article_counts", _db_cnts)
+
+# Restore per-source article lists into session_state ONLY if empty.
+# If the user just ran a fresh search, their Article objects stay (not overwritten).
+for _src_name, _arts in _by_src.items():
+    _ss_key = _sk(review_id, f"articles_{_src_name}")
+    if not st.session_state.get(_ss_key):
+        st.session_state[_ss_key] = _arts
+
+# Also restore unified full-text list if available
+_ft_key = _sk(review_id, "unified_fulltext")
+if not st.session_state.get(_ft_key):
+    _ft_arts = article_repo.get_articles_with_fulltext(review_id)
+    if _ft_arts:
+        st.session_state[_ft_key] = _ft_arts
 
 # Page header
 st.markdown(f"""
@@ -1597,29 +1676,122 @@ st.markdown(f"""
     </div>
 </div>""", unsafe_allow_html=True)
 
-# Metrics dashboard — 7 columns
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-_metric_styles = [
-    ("Total",       counts["total"],                "📄", ""),
-    ("S1 Included", counts["included"],             "✓",  "green"),
-    ("S1 Excluded", counts["excluded"],             "✕",  "rose"),
-    ("S1 Unsure",   counts["unsure"],               "?",  "amber"),
-    ("S2 Included", s2_counts.get("s2_included",0),"✦",  "teal"),
-    ("Conflicts",   counts.get("conflict", 0),      "⚡", "violet"),
-    ("Pending",     counts["pending"],              "◷",  ""),
+# ── Stage 1 metrics row ───────────────────────────────────────────────────────
+st.markdown('<div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.08em;color:#6B7280;margin-bottom:0.3rem;">'
+            '📋 Stage 1 — Title/Abstract Screening</div>', unsafe_allow_html=True)
+s1c1,s1c2,s1c3,s1c4,s1c5,s1c6 = st.columns(6)
+s1_metrics = [
+    ("Total Articles",  counts["total"],           "📄"),
+    ("Included",        counts["included"],         "✅"),
+    ("Excluded",        counts["excluded"],         "❌"),
+    ("Unsure",          counts["unsure"],           "❓"),
+    ("Conflicts",       counts.get("conflict",0),  "⚡"),
+    ("Pending",         counts["pending"],          "◷"),
 ]
-for col, (label, val, icon, color) in zip([c1,c2,c3,c4,c5,c6,c7], _metric_styles):
-    col.metric(f"{icon}  {label}", val)
+for col,(label,val,icon) in zip([s1c1,s1c2,s1c3,s1c4,s1c5,s1c6], s1_metrics):
+    col.metric(f"{icon} {label}", val)
 
-# Tabs
-tabs = st.tabs([
-    "🔍  Search",
-    "📋  Screening",
-    "✦  AI Analysis",
-    "⬡  PRISMA",
-])
+# S1 progress bar
+_s1_done = counts["included"] + counts["excluded"] + counts["unsure"]
+if counts["total"] > 0:
+    st.progress(_s1_done / counts["total"],
+                text=f"Stage 1: {_s1_done}/{counts['total']} screened")
 
-with tabs[0]:
+# ── Stage 2 metrics row ───────────────────────────────────────────────────────
+st.markdown('<div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.08em;color:#6B7280;margin:0.75rem 0 0.3rem;">'
+            '📄 Stage 2 — Full-text Screening</div>', unsafe_allow_html=True)
+s2c1,s2c2,s2c3,s2c4,s2c5,s2c6 = st.columns(6)
+_s2_total    = counts["included"]
+_s2_inc      = s2_counts.get("s2_included", 0)
+_s2_exc      = s2_counts.get("s2_excluded", 0)
+_s2_uns      = s2_counts.get("s2_unsure",   0)
+_s2_conflict = len(screen_repo.get_conflicts(review_id, "full_text"))
+_s2_pending  = max(_s2_total - _s2_inc - _s2_exc - _s2_uns, 0)
+s2_metrics   = [
+    ("Eligible (from S1)", _s2_total,    "📥"),
+    ("Included",           _s2_inc,      "✅"),
+    ("Excluded",           _s2_exc,      "❌"),
+    ("Unsure",             _s2_uns,      "❓"),
+    ("Conflicts",          _s2_conflict, "⚡"),
+    ("Pending",            _s2_pending,  "◷"),
+]
+for col,(label,val,icon) in zip([s2c1,s2c2,s2c3,s2c4,s2c5,s2c6], s2_metrics):
+    col.metric(f"{icon} {label}", val)
+
+if _s2_total > 0:
+    _s2_done = _s2_inc + _s2_exc + _s2_uns
+    _s2_progress = min(_s2_done / _s2_total, 1.0)   # cap at 1.0
+    st.progress(_s2_progress,
+                text=f"Stage 2: {min(_s2_done, _s2_total)}/{_s2_total} screened")
+
+# ── Sidebar navigation ────────────────────────────────────────────────────────
+_NAV_STEPS = [
+    ("🔍", "Search",      "Step 1: Find literature"),
+    ("📋", "Screening",   "Step 2: Screen articles"),
+    ("✦",  "AI Analysis", "Step 3: Analyse evidence"),
+    ("⬡",  "PRISMA",      "Step 4: Generate diagram"),
+]
+
+if "active_page" not in st.session_state:
+    st.session_state["active_page"] = "Search"
+
+with st.sidebar:
+    st.divider()
+    st.markdown('<div style="padding:0 1rem 0.5rem;font-size:0.68rem;font-weight:700;'
+                'color:rgba(255,255,255,0.35);text-transform:uppercase;'
+                'letter-spacing:0.09em;">Workflow</div>', unsafe_allow_html=True)
+
+    for i, (icon, page, hint) in enumerate(_NAV_STEPS, 1):
+        is_active = st.session_state["active_page"] == page
+        _bg    = "rgba(201,151,76,0.18)" if is_active else "transparent"
+        _border= "rgba(201,151,76,0.6)"  if is_active else "transparent"
+        _color = "#C9974C" if is_active else "rgba(255,255,255,0.6)"
+        _bold  = "700" if is_active else "400"
+        st.markdown(
+            f'<div style="margin:0.15rem 0.75rem;border-radius:8px;'
+            f'background:{_bg};border:1px solid {_border};">',
+            unsafe_allow_html=True)
+        if st.button(
+            f"{icon}  {page}",
+            key=f"nav_{page}",
+            use_container_width=True,
+            type="secondary",
+        ):
+            st.session_state["active_page"] = page
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# Progress sidebar block — runs AFTER counts/s2_counts are defined
+with st.sidebar:
+    st.divider()
+    _s1_pct = int(100 * _s1_done / counts["total"]) if counts.get("total", 0) > 0 else 0
+    _s2_done_safe = _s2_inc + _s2_exc + _s2_uns
+    _s2_pct = min(int(100 * _s2_done_safe / _s2_total), 100) if _s2_total > 0 else 0
+    st.markdown(f"""
+    <div style="padding:0 1rem;">
+        <div style="font-size:0.68rem;font-weight:700;color:rgba(255,255,255,0.35);
+                    text-transform:uppercase;letter-spacing:0.09em;margin-bottom:0.5rem;">
+            Progress</div>
+        <div style="font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.2rem;">
+            Stage 1: {_s1_pct}%</div>
+        <div style="background:rgba(255,255,255,0.1);border-radius:99px;height:4px;margin-bottom:0.6rem;">
+            <div style="background:#C9974C;width:{_s1_pct}%;height:4px;border-radius:99px;"></div>
+        </div>
+        <div style="font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.2rem;">
+            Stage 2: {_s2_pct}%</div>
+        <div style="background:rgba(255,255,255,0.1);border-radius:99px;height:4px;">
+            <div style="background:#059669;width:{_s2_pct}%;height:4px;border-radius:99px;"></div>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+_active = st.session_state["active_page"]
+    
+
+# ── Content area ──────────────────────────────────────────────────────────────
+if _active == "Search":
     domain_options = registry.domain_display_names()
     domain_choice  = st.selectbox("Research Domain", options=list(domain_options.keys()),
                                   format_func=lambda k: domain_options[k], key="domain_select")
@@ -1629,11 +1801,18 @@ with tabs[0]:
     else:
         _render_ml_form(review_id, registry, search_repo, article_repo)
 
-with tabs[1]:
+elif _active == "Screening":
     render_screening_panel(review_id)
 
-with tabs[2]:
+elif _active == "AI Analysis":
     render_ai_analysis_panel(review_id)
 
-with tabs[3]:
+elif _active == "PRISMA":
     render_prisma_diagram(review_id)
+
+
+
+
+
+
+

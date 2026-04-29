@@ -7,8 +7,14 @@ def inject_styles() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
+
 _CSS = """
+
 <style>
+[data-testid="stSidebarCollapseButton"] {
+  display: none !important;
+}
+
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap');
 
 /* Remove white top rectangle completely */
@@ -80,6 +86,22 @@ section[data-testid="stSidebar"] .streamlit-expanderHeader {
   font-weight: 700;
   border-radius: 9999px !important;
 }
+
+section[data-testid="stSidebar"] .stButton > button[kind="secondary"] {
+  background: transparent !important;
+  border: 2px solid #00C4A8 !important;
+  color: #00C4A8 !important;
+}
+
+
+
+section[data-testid="stSidebar"] .stButton > button:hover {
+  background: linear-gradient(90deg, #00C4A8, #00A890) !important;
+  color: #081020 !important;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(0, 196, 168, 0.3);
+}
+
 
 /* Hide default Streamlit chrome */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {

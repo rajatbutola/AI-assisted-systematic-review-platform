@@ -111,7 +111,10 @@ Abstract:
 {abstract}
 
 JSON with these exact keys:
-sample_size, age_group, sex_distribution, condition_severity, intervention, comparator, follow_up_duration, primary_outcome, primary_outcome_result, secondary_outcomes, adverse_events, statistical_significance, study_design, country_setting
+sample_size, age_group, sex_distribution, condition_severity, intervention, comparator, follow_up_duration, primary_outcome, primary_outcome_result, events_intervention, events_comparator, secondary_outcomes, adverse_events, statistical_significance, study_design, country_setting
+
+events_intervention: number of events in intervention arm, format "n/N (x%)" e.g. "19/266 (7.1%)". Use "NR" if not reported.
+events_comparator: number of events in comparator arm, format "n/N (x%)" e.g. "44/359 (12.3%)". Use "NR" if not reported.
 
 JSON:"""
 

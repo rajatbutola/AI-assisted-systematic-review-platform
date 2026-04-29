@@ -126,22 +126,56 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
 
     gen_cfg = GENERATION_CONFIG[task]
 
-    # Truncate prompt if too long
-    max_chars = MAX_INPUT_TOKENS * 4  # rough chars-per-token estimate
-    if len(prompt) > max_chars:
-        prompt = prompt[:max_chars]
-        logger.warning("Prompt truncated to %d chars for task '%s'", max_chars, task)
+   # Truncate prompt using actual token count to prevent llama.cpp crash.
+    # The access violation (ggml assert i01 >= 0) happens when token index
+    # exceeds the model's embedding matrix size due to context overflow.
+    backend_type_check, model_check = load_model()
+    if backend_type_check == "gguf" and model_check is not None:
+        try:
+            # Use llama.cpp's own tokenizer — exact token count
+            tokens = model_check.tokenize(prompt.encode("utf-8"))
+            gen_cfg_check = GENERATION_CONFIG.get(task, {})
+            max_out = gen_cfg_check.get("max_tokens", 512)
+            # Leave room for output + safety margin of 64 tokens
+            max_in = N_CTX - max_out - 64
+            if len(tokens) > max_in:
+                tokens = tokens[:max_in]
+                prompt = model_check.detokenize(tokens).decode("utf-8", errors="ignore")
+                logger.warning(
+                    "Prompt truncated from %d to %d tokens for task '%s'",
+                    len(tokens), max_in, task
+                )
+        except Exception as e:
+            # Fallback: conservative char truncation (3 chars/token for medical text)
+            logger.warning("Token count failed (%s), using char fallback", e)
+            max_chars = (N_CTX - 600) * 3
+            if len(prompt) > max_chars:
+                prompt = prompt[:max_chars]
+                logger.warning("Prompt truncated to %d chars", max_chars)
+    else:
+        # Non-GGUF backends: char-based truncation
+        max_chars = MAX_INPUT_TOKENS * 3
+        if len(prompt) > max_chars:
+            prompt = prompt[:max_chars]
+            logger.warning("Prompt truncated to %d chars for task '%s'", max_chars, task)
 
     backend_type, model = load_model()
 
-    if backend_type == "gguf":
-        text = _run_gguf(model, prompt, gen_cfg)
-    elif backend_type == "transformers":
-        text = _run_transformers(model, prompt, gen_cfg)
-    elif backend_type == "ollama":
-        text = _run_ollama(prompt, gen_cfg)
-    else:
-        raise RuntimeError(f"Unexpected backend type: {backend_type}")
+    try:
+        if backend_type == "gguf":
+            text = _run_gguf(model, prompt, gen_cfg)
+        elif backend_type == "transformers":
+            text = _run_transformers(model, prompt, gen_cfg)
+        elif backend_type == "ollama":
+            text = _run_ollama(prompt, gen_cfg)
+        else:
+            raise RuntimeError(f"Unexpected backend type: {backend_type}")
+    except RuntimeError as e:
+        logger.error("run_inference failed for task '%s': %s", task, e)
+        return f"[LLM Error: {e}]"
+    except Exception as e:
+        logger.error("run_inference unexpected error for task '%s': %s", task, e)
+        return f"[LLM Error: {type(e).__name__}: {e}]"
 
     # Strip any accidental echo of the prompt from the beginning of the output
     text = _strip_prompt_echo(text, prompt)
@@ -153,16 +187,31 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
 # ── Backend implementations ───────────────────────────────────────────────────
 
 def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
-    """Run inference using llama-cpp-python (GGUF model)."""
-    response = llm(
-        prompt,
-        max_tokens=gen_cfg["max_tokens"],
-        temperature=gen_cfg["temperature"],
-        # FIX 3: no stop tokens for extraction/scoring so full JSON is returned
-        stop=gen_cfg.get("stop", []),
-        echo=False,   # NEVER echo the prompt
-    )
-    return response["choices"][0]["text"]
+    """Run inference using llama-cpp-python (GGUF model).
+    Catches native C++ exceptions that llama-cpp-python surfaces as
+    RuntimeError or Exception to prevent Streamlit from crashing.
+    """
+    try:
+        response = llm(
+            prompt,
+            max_tokens=gen_cfg["max_tokens"],
+            temperature=gen_cfg["temperature"],
+            stop=gen_cfg.get("stop", []),
+            echo=False,
+        )
+        return response["choices"][0]["text"]
+    except Exception as e:
+        err = str(e).lower()
+        if any(kw in err for kw in ["access violation", "ggml_assert",
+                                     "context", "kv cache", "invalid"]):
+            logger.error("llama.cpp native crash caught: %s", e)
+            raise RuntimeError(
+                "LLM context overflow — the input text is too long for the "
+                f"model's context window ({N_CTX} tokens). "
+                "Try reducing the number of articles analysed at once, "
+                "or increase N_CTX in config/settings.py."
+            ) from e
+        raise
 
 
 def _run_transformers(pipe, prompt: str, gen_cfg: dict) -> str:

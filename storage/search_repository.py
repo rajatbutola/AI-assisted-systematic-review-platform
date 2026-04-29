@@ -101,9 +101,39 @@ class SearchRepository:
             ]
 
     def get_source_totals(self, review_id: int) -> dict:
-        """Return {source_name: total_n_results} summed across all searches."""
+        """Return {source_name: unique_article_count} from actual DB articles.
+        Counts distinct articles per source joined to review_articles,
+        so repeated searches and cross-search duplicates are not double-counted.
+        Falls back to summing n_results if no articles are in DB yet.
+        """
+        from storage.database import get_connection
+        with get_connection() as conn:
+            rows = conn.execute("""
+                SELECT a.source, COUNT(DISTINCT a.pmid) AS n
+                FROM articles a
+                JOIN review_articles ra ON a.pmid = ra.pmid
+                WHERE ra.review_id = ?
+                GROUP BY a.source
+            """, (review_id,)).fetchall()
+
+        if rows:
+            src_map = {
+                "pubmed":       "PubMed",
+                "europe_pmc":   "Europe PMC",
+                "core":         "CORE",
+                "semantic_scholar": "Semantic Scholar",
+                "openalex":     "OpenAlex",
+            }
+            totals: dict = {}
+            for row in rows:
+                src_raw  = (row[0] or "pubmed").lower()
+                src_name = src_map.get(src_raw, src_raw.upper())
+                totals[src_name] = int(row[1])
+            return totals
+
+        # Fallback: no articles saved yet — sum raw n_results
         searches = self.list_searches_for_review(review_id)
-        totals: dict = {}
+        totals = {}
         for s in searches:
             src = s.get("source_name") or "PubMed"
             totals[src] = totals.get(src, 0) + int(s.get("n_results") or 0)

@@ -39,7 +39,8 @@ def run_migrations() -> None:
     _migration_004_add_prisma_settings_table()
     _migration_005_add_full_texts_table()
     _migration_006_add_analysis_json_column()
-    _migration_007_schema_hardening()          # ← new
+    _migration_007_schema_hardening()
+    _migration_008()          # ← new
 
 
 # ── 001 ───────────────────────────────────────────────────────────────────────
@@ -135,6 +136,17 @@ def _migration_006_add_analysis_json_column() -> None:
         migration="006"
     )
 
+
+def _migration_008() -> None:
+    """Add final_reason column to adjudications for Option B canonical reason."""
+    with get_connection() as conn:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(adjudications)").fetchall()]
+        if "final_reason" not in cols:
+            conn.execute(
+                "ALTER TABLE adjudications ADD COLUMN final_reason TEXT DEFAULT ''")
+    logger.info("Migration 008: adjudications.final_reason ready.")
+    
 
 # ── Shared helper ──────────────────────────────────────────────────────────────
 
