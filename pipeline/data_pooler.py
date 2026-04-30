@@ -68,6 +68,170 @@ logger = logging.getLogger(__name__)
 
 _NR = "Not reported"   # shorthand
 
+# ── Source anchoring ──────────────────────────────────────────────────────────
+
+from difflib import SequenceMatcher
+
+@dataclass
+class SourceAnchor:
+    """
+    Records where an extracted value was found in the source text.
+    Option B: exact/fuzzy string match against abstract sentences.
+    Option C: field anchoring — the LLM was asked to extract verbatim.
+    """
+    field:       str   = ""
+    value:       str   = ""
+    sentence_no: int   = -1    # 1-based; -1 = not found
+    sentence:    str   = ""    # the matched source sentence
+    similarity:  float = 0.0   # 0.0–1.0 match score
+    method:      str   = ""    # "exact", "fuzzy", or "not_found"
+
+    def citation(self) -> str:
+        """Human-readable citation string."""
+        if self.sentence_no < 1:
+            return "Source not located"
+        page = getattr(self, "_page_no", None)
+        if page:
+            return f"Page {page}, sentence {self.sentence_no}"
+        return f"Abstract, sentence {self.sentence_no}"
+
+    def confidence_label(self) -> str:
+        if self.similarity >= 0.95: return "✅ Exact"
+        if self.similarity >= 0.75: return "🟡 Fuzzy"
+        if self.similarity >= 0.50: return "🟠 Partial"
+        return "❌ Not found"
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split abstract into sentences. Simple rule-based splitter."""
+    # Split on ". ", "! ", "? " but not on abbreviations like "vs."
+    text = text.strip()
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _fuzzy_match(value: str, sentences: List[str],
+                 threshold: float = 0.45) -> SourceAnchor:
+    """
+    Find the sentence in the abstract that best matches the extracted value.
+    Uses SequenceMatcher (Option B). Returns the best match above threshold.
+    """
+    if not value or value == _NR or len(value) < 4:
+        return SourceAnchor(value=value, method="not_found")
+
+    value_clean = value.lower().strip()
+    best_score  = 0.0
+    best_idx    = -1
+
+    for i, sent in enumerate(sentences):
+        sent_clean = sent.lower().strip()
+
+        # Check for direct containment first (Option C exact anchor)
+        if value_clean in sent_clean:
+            return SourceAnchor(
+                field="", value=value,
+                sentence_no=i + 1, sentence=sent,
+                similarity=1.0, method="exact"
+            )
+
+        # Fuzzy match: compare value against sentence
+        score = SequenceMatcher(None, value_clean, sent_clean).ratio()
+        # Also check if most words of value appear in sentence (word overlap)
+        value_words = set(value_clean.split())
+        sent_words  = set(sent_clean.split())
+        word_overlap = (len(value_words & sent_words) / len(value_words)
+                        if value_words else 0)
+        combined = max(score, word_overlap * 0.9)
+
+        if combined > best_score:
+            best_score = combined
+            best_idx   = i
+
+    if best_idx >= 0 and best_score >= threshold:
+        return SourceAnchor(
+            field="", value=value,
+            sentence_no=best_idx + 1,
+            sentence=sentences[best_idx],
+            similarity=round(best_score, 3),
+            method="fuzzy"
+        )
+
+    return SourceAnchor(value=value, method="not_found", similarity=round(best_score, 3))
+
+
+def anchor_study_data(sd: "StudyData", abstract: str,
+                      full_text: str = "") -> Dict[str, SourceAnchor]:
+    """
+    Option B + C: anchor each extracted field to its source location.
+
+    If full_text is provided (with [PAGE N] markers from pdfplumber):
+      → searches page by page, reports page number + sentence number within page
+    If only abstract is available:
+      → searches abstract sentences, reports sentence number only
+    """
+    fields_to_anchor = {
+        "sample_size":              sd.sample_size,
+        "primary_outcome_result":   sd.primary_outcome_result,
+        "statistical_significance": sd.statistical_significance,
+        "follow_up_duration":       sd.follow_up_duration,
+        "adverse_events":           sd.adverse_events,
+        "intervention":             sd.intervention,
+        "comparator":               sd.comparator,
+        "primary_outcome":          sd.primary_outcome,
+    }
+
+    anchors: Dict[str, SourceAnchor] = {}
+
+    if full_text and "[PAGE " in full_text:
+        # ── Full text with page markers (uploaded/parsed PDF) ─────────────────
+        pages = re.split(r'\[PAGE (\d+)\]', full_text)
+        # pages = ["", "1", "page1 text", "2", "page2 text", ...]
+        page_map: List[tuple] = []  # list of (page_no, sentences)
+        i = 1
+        while i < len(pages) - 1:
+            try:
+                page_no = int(pages[i])
+                text    = pages[i + 1]
+                sents   = _split_sentences(text)
+                page_map.append((page_no, sents))
+                i += 2
+            except (ValueError, IndexError):
+                i += 1
+
+        for field_name, value in fields_to_anchor.items():
+            if not value or value == _NR or len(value) < 4:
+                continue
+            best: Optional[SourceAnchor] = None
+            for page_no, sents in page_map:
+                anchor = _fuzzy_match(value, sents)
+                if anchor.sentence_no > 0:
+                    anchor.field = field_name
+                    # Override citation to include page number
+                    anchor._page_no = page_no
+                    if best is None or anchor.similarity > best.similarity:
+                        best = anchor
+                        best.sentence_no = anchor.sentence_no
+                        # Store page info in the citation
+                        best._page_no = page_no
+            if best and best.sentence_no > 0:
+                best.field = field_name
+                anchors[field_name] = best
+            else:
+                anchors[field_name] = SourceAnchor(
+                    field=field_name, value=value, method="not_found")
+
+    else:
+        # ── Abstract only ─────────────────────────────────────────────────────
+        sentences = _split_sentences(abstract)
+        if not sentences:
+            return {}
+        for field_name, value in fields_to_anchor.items():
+            if value and value != _NR:
+                anchor = _fuzzy_match(value, sentences)
+                anchor.field = field_name
+                anchors[field_name] = anchor
+
+    return anchors
 
 @dataclass
 class StudyData:
@@ -123,7 +287,8 @@ class StudyData:
         return cls(**known)
 
 
-def extract_study_data(abstract: str, pmid: str = "", title: str = "") -> StudyData:
+def extract_study_data(abstract: str, pmid: str = "",
+                       title: str = "", full_text: str = "") -> "StudyData":
     if not abstract or not abstract.strip():
         return StudyData(pmid=pmid, title=title,
                          primary_outcome_result="No abstract available.")
@@ -131,7 +296,12 @@ def extract_study_data(abstract: str, pmid: str = "", title: str = "") -> StudyD
         prompt = DATA_POOLING_PROMPT.format(abstract=abstract)
         raw    = run_inference(prompt, task="extraction")
         logger.debug("DataPool raw [%s]: %r", pmid, raw[:400])
-        return _parse_study_data(raw, pmid=pmid, title=title)
+        sd = _parse_study_data(raw, pmid=pmid, title=title)
+        # Option B + C: anchor each field back to its source sentence
+        sd._anchors   = anchor_study_data(sd, abstract, full_text=full_text)
+        sd._sentences = (_split_sentences(full_text)
+                         if full_text else _split_sentences(abstract))
+        return sd
     except Exception as e:
         logger.error("Data pooling failed PMID %s: %s", pmid, e)
         return StudyData(pmid=pmid, title=title,

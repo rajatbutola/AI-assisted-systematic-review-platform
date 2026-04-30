@@ -113,7 +113,34 @@ logger = logging.getLogger(__name__)
 article_repo      = ArticleRepository()
 screening_repo    = ScreeningRepository()
 adjudication_repo = AdjudicationRepository()
- 
+
+def _extract_pdf_text(uploaded_file) -> tuple:
+    """
+    Extract text from an uploaded PDF using pdfplumber.
+    Returns (full_text: str, n_pages: int).
+    Falls back gracefully if pdfplumber is not installed.
+    """
+    try:
+        import pdfplumber
+        import io
+        pdf_bytes = uploaded_file.read()
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            n_pages = len(pdf.pages)
+            for page_no, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                if text.strip():
+                    # Prefix each page with a marker for future page-level anchoring
+                    pages_text.append(f"[PAGE {page_no}]\n{text}")
+        full_text = "\n\n".join(pages_text)
+        return full_text, n_pages
+    except ImportError:
+        return "", 0
+    except Exception as e:
+        logger.error("PDF extraction error: %s", e)
+        return "", 0
+
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 DECISION_EMOJI = {"include":"🟢","exclude":"🔴","unsure":"🟡",None:"⬜"}
 DECISION_LABEL = {"include":"Include","exclude":"Exclude","unsure":"Unsure",None:"Pending"}
@@ -647,19 +674,80 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                 f'</div>', unsafe_allow_html=True)
  
         # ── Full text or abstract ──────────────────────────────────────
+        # ── PDF upload (manual full text) ─────────────────────────────
+        if not has_ft:
+            with st.expander("📤 Upload full text PDF (paywalled papers)",
+                             expanded=False):
+                st.caption(
+                    "Download the PDF through your institution, then upload here. "
+                    "Text will be extracted and stored permanently in the database."
+                )
+                uploaded = st.file_uploader(
+                    "Choose PDF", type=["pdf"],
+                    key=f"pdf_upload_{pmid}_{review_id}",
+                    label_visibility="collapsed"
+                )
+                if uploaded is not None:
+                    with st.spinner("Extracting text from PDF…"):
+                        extracted_text, n_pages = _extract_pdf_text(uploaded)
+                    if extracted_text and len(extracted_text.strip()) > 100:
+                        # Save to DB
+                        try:
+                            from models.schemas import Article as _Article, \
+                                ArticleSource as _AS, ResearchDomain as _RD
+                            _src = article.get("source","pubmed")
+                            try:
+                                _src_enum = _AS(_src)
+                            except ValueError:
+                                _src_enum = _AS.EUROPE_PMC
+                            _art_obj = _Article(
+                                pmid=pmid,
+                                title=article.get("title",""),
+                                abstract=article.get("abstract",""),
+                                authors=article.get("authors",[]),
+                                journal=article.get("journal",""),
+                                year=article.get("year",""),
+                                doi=article.get("doi",""),
+                                source=_src_enum,
+                                domain=_RD.MEDICAL,
+                                full_text=extracted_text,
+                            )
+                            article_repo.save_full_texts([_art_obj])
+                            # Update ft_map so summariser uses it immediately
+                            full_text = extracted_text
+                            has_ft    = True
+                            ft_map[pmid] = extracted_text
+                            st.success(
+                                f"✅ PDF uploaded — {n_pages} pages, "
+                                f"{len(extracted_text):,} characters extracted and saved."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not save to DB: {e}")
+                    else:
+                        st.error(
+                            "Could not extract readable text from this PDF. "
+                            "It may be a scanned image — OCR is not yet supported."
+                        )
+
+        # ── Full text or abstract ──────────────────────────────────────
         display_text = full_text if has_ft else (article.get("abstract") or "")
-        label = "Full Text" if has_ft else "Abstract (no full text retrieved)"
+        label = (f"📄 Full Text ({len(full_text):,} chars)"
+                 if has_ft else "📋 Abstract (no full text retrieved)")
         with st.expander(label, expanded=True):
             if has_ft:
-                # Show first ~3000 chars of full text
                 preview = display_text[:3000]
                 if len(display_text) > 3000:
-                    preview += "\n\n*[Full text truncated for display — complete text used for AI summary]*"
+                    preview += (
+                        "\n\n*[Display truncated — full text used for AI summary]*"
+                    )
                 st.markdown(preview)
             else:
                 st.write(display_text or "No text available.")
-                st.caption("💡 Run Search → Full Texts to retrieve the full paper.")
- 
+                st.caption(
+                    "💡 Retrieve via Search → Full Texts, or upload PDF above."
+                )
+
         # ── Per-card AI Summariser ─────────────────────────────────────
         cached_sum = _get_cached(review_id, pmid, "s2_summary")
         sc1, sc2 = st.columns([1,4])

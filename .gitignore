@@ -26,3 +26,9 @@ models/
 
 # Streamlit cache
 .streamlit/
+
+project_dump.txt
+project_dump_BeforeUMLS.txt
+tree_view.py
+export_code.py
+debug_s2.py

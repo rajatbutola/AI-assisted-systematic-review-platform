@@ -575,6 +575,46 @@ def _render_article_cards(articles, pmc_urls: dict,
                     st.success("✅ Full text available")
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fetch_and_parse_pdf
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _fetch_and_parse_pdf(pdf_url: str, timeout: int = 30) -> str:
+    """
+    Download a PDF from a URL and extract text using pdfplumber.
+    Returns extracted text with [PAGE N] markers, or "" on failure.
+    Only attempts open-access URLs — never follows redirects to paywalls.
+    """
+    try:
+        import pdfplumber, io, requests as _req
+        resp = _req.get(
+            pdf_url, timeout=timeout,
+            headers={"User-Agent": "SR-Platform/1.0 (research use)"},
+            stream=True
+        )
+        if resp.status_code != 200:
+            return ""
+        content_type = resp.headers.get("content-type","").lower()
+        if "pdf" not in content_type and "octet-stream" not in content_type:
+            return ""
+        pdf_bytes = resp.content
+        if len(pdf_bytes) < 1000:  # too small to be a real PDF
+            return ""
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_no, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages_text.append(f"[PAGE {page_no}]\n{text}")
+        full_text = "\n\n".join(pages_text)
+        return full_text if len(full_text.strip()) > 200 else ""
+    except Exception as e:
+        logger.debug("_fetch_and_parse_pdf %s: %s", pdf_url, e)
+        return ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UNIFIED FULL-TEXT TAB
 # ══════════════════════════════════════════════════════════════════════════════
@@ -932,6 +972,38 @@ def _run_unified_fulltext(review_id, pmid_articles, epmc_articles_, pmc_cl, arti
                     for f in as_completed(futs):
                         try: f.result()
                         except Exception as e: logger.debug("Pass 4 exception: %s", e)
+
+                        
+    # ── PASS 4.5 — Parse PDFs that were found but text not yet extracted ──────
+    # For articles where we have a PDF URL but no extracted text yet,
+    # attempt to download and parse the PDF.
+    articles_needing_parse = [
+        a for a in all_articles
+        if _af(a,"pmid","") in pdf_urls
+        and _af(a,"pmid","") not in full_texts
+    ]
+    if articles_needing_parse:
+        with st.spinner(
+            f"Pass 4.5 — Parsing {len(articles_needing_parse)} "
+            "open-access PDFs (this may take a minute)…"
+        ):
+            def _pass45_worker(article):
+                pmid    = _af(article,"pmid","")
+                pdf_url = pdf_urls.get(pmid,"")
+                if not pdf_url: return
+                text = _fetch_and_parse_pdf(pdf_url)
+                if text:
+                    with lock:
+                        full_texts[pmid] = text
+                        enriched_map.setdefault(pmid, article)
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = [ex.submit(_pass45_worker, a)
+                        for a in articles_needing_parse]
+                for f in as_completed(futs):
+                    try: f.result()
+                    except Exception as e:
+                        logger.debug("Pass 4.5: %s", e)
 
     # Merge full_texts into Article objects
     for article in all_articles:
@@ -1393,7 +1465,8 @@ def _do_core_search(review_id, population, intervention, comparison,
         st.info("No results from CORE. Try broadening your PICO terms.")
         return
 
-    articles: list = []
+    articles:       list = []
+    _core_pdf_urls: dict = {}  # pmid → pdf download URL
     for hit in results:
         try:
             core_id  = str(hit.get("id",""))
@@ -1425,9 +1498,13 @@ def _do_core_search(review_id, population, intervention, comparison,
             art = Article(pmid=uid, title=title, abstract=abstract, authors=authors,
                           journal=journal, year=year, doi=doi or None,
                           url=article_url, source=_core_source, domain=ResearchDomain.MEDICAL)
-            if download_url:
-                art = art.model_copy(update={"full_text": f"PDF:{download_url}"})
             articles.append(art)
+            # Store download_url separately for the full-text pipeline
+            # Do NOT store PDF: placeholder — save_full_texts ignores it anyway
+            if download_url:
+                # We'll attempt to parse this in the full-text pipeline
+                # Store url in a side-channel so Pass 4 can pick it up
+                _core_pdf_urls[uid] = download_url
         except Exception as e:
             logger.warning("CORE parse error: %s", e)
 
@@ -1438,6 +1515,36 @@ def _do_core_search(review_id, population, intervention, comparison,
     search_id = search_repo.create_search(review_id=review_id, query=query,
                                           n_results=len(articles), source_name="CORE")
     result    = article_repo.save_articles(articles, review_id, search_id)
+    st.success(f"✅ **{len(articles)}** CORE articles found | "
+               f"{result['saved']} new | {result['duplicates']} already in DB")
+
+    # Auto-download and parse open-access CORE PDFs in background
+    if _core_pdf_urls:
+        _parsed_count = 0
+        _prog = st.progress(0, text="Parsing open-access CORE PDFs…")
+        _total_pdfs = len(_core_pdf_urls)
+        from models.schemas import Article as _A, ArticleSource as _AS, ResearchDomain as _RD
+        _ft_arts = []
+        for _i, (_uid, _purl) in enumerate(_core_pdf_urls.items()):
+            _prog.progress((_i+1)/_total_pdfs,
+                           text=f"Parsing PDF {_i+1}/{_total_pdfs}…")
+            _text = _fetch_and_parse_pdf(_purl)
+            if _text:
+                try:
+                    _ft_arts.append(_A(
+                        pmid=_uid, title="", abstract="", authors=[],
+                        journal="", year="", doi=None, url="",
+                        source=_AS("core"), domain=_RD.MEDICAL,
+                        full_text=_text,
+                    ))
+                    _parsed_count += 1
+                except Exception:
+                    pass
+        _prog.empty()
+        if _ft_arts:
+            article_repo.save_full_texts(_ft_arts)
+            st.info(f"📄 **{_parsed_count}** CORE PDFs parsed and stored.")
+
     st.success(f"✅ **{len(articles)}** CORE articles found | "
                f"{result['saved']} new | {result['duplicates']} already in DB")
 

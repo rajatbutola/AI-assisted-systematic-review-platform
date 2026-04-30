@@ -157,21 +157,47 @@ def _deserialise(task: str, raw: Any) -> Any:
             return StudyData.from_dict(raw)
         if task == "rob2":
             from pipeline.rob2_assessor import RoB2Assessment, RoB2Domain
-            from dataclasses import fields
-            doms = [RoB2Domain(**d) for d in raw.get("domains", [])]
-            r = {k: v for k, v in raw.items() if k != "domains"}
-            return RoB2Assessment(domains=doms, **r)
-        if task in ("nos", "nos_cohort", "nos_cc", "nos_xs"):
-            from pipeline.nos_assessor import (
-                NOSAssessment, SelectionDomain,
-                ComparabilityDomain, OutcomeDomain
+            def _rob2_domain(d):
+                if not isinstance(d, dict):
+                    return RoB2Domain(name="Unknown")
+                return RoB2Domain(
+                    name=d.get("name", ""),
+                    judgement=d.get("judgement", "no_information"),
+                    signals=d.get("signals", []),
+                    rationale=d.get("rationale", ""),
+                )
+            return RoB2Assessment(
+                d1_randomisation = _rob2_domain(raw.get("d1_randomisation", {})),
+                d2_deviations    = _rob2_domain(raw.get("d2_deviations", {})),
+                d3_missing_data  = _rob2_domain(raw.get("d3_missing_data", {})),
+                d4_measurement   = _rob2_domain(raw.get("d4_measurement", {})),
+                d5_reporting     = _rob2_domain(raw.get("d5_reporting", {})),
+                overall          = raw.get("overall", "no_information"),
+                overall_rationale= raw.get("overall_rationale", ""),
+                notes            = raw.get("notes", ""),
             )
-            sel  = SelectionDomain(**raw.get("selection", {}))
-            comp = ComparabilityDomain(**raw.get("comparability", {}))
-            out  = OutcomeDomain(**raw.get("outcome", {}))
-            r    = {k: v for k, v in raw.items()
-                    if k not in ("selection","comparability","outcome")}
-            return NOSAssessment(selection=sel, comparability=comp, outcome=out, **r)
+        if task in ("nos", "nos_cohort", "nos_cc", "nos_xs"):
+            from pipeline.nos_assessor import NOSAssessment, NOSDomain
+            def _nos_domain(d, default_name=""):
+                if not isinstance(d, dict):
+                    return NOSDomain(name=default_name)
+                return NOSDomain(
+                    name=d.get("name", default_name),
+                    stars=d.get("stars", 0),
+                    max_stars=d.get("max_stars", 0),
+                    items=d.get("items", []),
+                    rationale=d.get("rationale", ""),
+                )
+            return NOSAssessment(
+                instrument   = raw.get("instrument", ""),
+                selection    = _nos_domain(raw.get("selection", {}),    "Selection"),
+                comparability= _nos_domain(raw.get("comparability", {}),"Comparability"),
+                outcome      = _nos_domain(raw.get("outcome", {}),      "Outcome / Exposure"),
+                total_stars  = raw.get("total_stars", 0),
+                max_stars    = raw.get("max_stars", 9),
+                quality_grade= raw.get("quality_grade", "poor"),
+                notes        = raw.get("notes", ""),
+            )
         if task in ("classify", "study_class"):
             from pipeline.study_classifier import StudyClassification
             return StudyClassification(**raw)
@@ -398,10 +424,13 @@ def _tab_data_pool(review_id, articles):
                 st.warning("No abstract — extraction will produce minimal data.")
 
             run_one = st.button("Extract Data", key=f"pool_{pmid}")
+
             if (run_all or run_one) and not cached:
                 with st.spinner("Extracting structured data…"):
                     try:
-                        sd = extract_study_data(abstract, pmid=pmid, title=title)
+                        # Get full text if available for page-level anchoring
+                        _ft = article_repo.get_full_text(pmid) or ""
+                        sd = extract_study_data(abstract, pmid=pmid, title=title, full_text=_ft)
                         _set_cached(review_id, pmid, "data_pool", sd)
                         ran_any = True
                     except Exception as e:
@@ -410,11 +439,67 @@ def _tab_data_pool(review_id, articles):
 
             sd = _get_cached(review_id, pmid, "data_pool")
             if sd:
-                row  = sd.to_table_row()
-                keys = [k for k in row if k not in ("PMID", "Title")]
+                row     = sd.to_table_row()
+                anchors = getattr(sd, "_anchors", {})
+                keys    = [k for k in row if k not in ("PMID","Title")]
+
+                # Field name → anchor key mapping
+                _field_map = {
+                    "N":               "sample_size",
+                    "Primary Result":  "primary_outcome_result",
+                    "Significance":    "statistical_significance",
+                    "Follow-up":       "follow_up_duration",
+                    "Adverse Events":  "adverse_events",
+                    "Intervention":    "intervention",
+                    "Comparator":      "comparator",
+                    "Primary Outcome": "primary_outcome",
+                }
+
                 cols = st.columns(2)
                 for i, k in enumerate(keys):
-                    cols[i % 2].markdown(f"**{k}:** {row[k] or '—'}")
+                    val    = row[k] or "—"
+                    anchor = anchors.get(_field_map.get(k, ""))
+                    if anchor and anchor.sentence_no > 0:
+                        cite = anchor.citation()
+                        conf = anchor.confidence_label()
+                        cols[i % 2].markdown(
+                            f"**{k}:** {val}  "
+                            f"<span style='font-size:0.72rem;color:#6B7280;"
+                            f"background:#F0FDF4;border:1px solid #BBF7D0;"
+                            f"border-radius:4px;padding:1px 5px;margin-left:4px;'>"
+                            f"{conf} · {cite}</span>",
+                            unsafe_allow_html=True
+                        )
+                        if anchor.method == "fuzzy":
+                            cols[i % 2].caption(
+                                f"  ↳ *\"{anchor.sentence[:120]}…\"*"
+                                if len(anchor.sentence) > 120
+                                else f"  ↳ *\"{anchor.sentence}\"*"
+                            )
+                    else:
+                        cols[i % 2].markdown(
+                            f"**{k}:** {val}  "
+                            f"<span style='font-size:0.72rem;color:#9B9B9A;"
+                            f"background:#F9F9F8;border:1px solid #E5E5E3;"
+                            f"border-radius:4px;padding:1px 5px;margin-left:4px;'>"
+                            f"❌ Not located</span>",
+                            unsafe_allow_html=True
+                        )
+
+                # Show numbered sentences for manual verification
+                sentences = getattr(sd, "_sentences", None)
+                if sentences:
+                    with st.expander(
+                        "🔍 Source sentences (for manual verification)",
+                        expanded=False
+                    ):
+                        for si, sent in enumerate(sentences, 1):
+                            st.markdown(
+                                f"<span style='color:#6B7280;font-size:0.72rem;"
+                                f"font-weight:700;margin-right:6px;'>S{si}</span>"
+                                f"<span style='font-size:0.83rem;'>{sent}</span>",
+                                unsafe_allow_html=True
+                            )
 
     if missing_abstract > 0:
         st.warning(f"⚠️ {missing_abstract} article(s) have no abstract.")
@@ -796,7 +881,7 @@ def _render_traffic_light(review_id, articles):
 
     fig.update_layout(
         height=max(320, 60 * n_domains + 80),
-        margin=dict(l=160, r=20, t=40, b=80),
+        margin=dict(l=160, r=20, t=60, b=120),
         plot_bgcolor="white",
         paper_bgcolor="white",
         legend=dict(orientation="h", yanchor="bottom", y=-0.25,
@@ -805,9 +890,9 @@ def _render_traffic_light(review_id, articles):
             tickmode="array",
             tickvals=list(range(n_studies)),
             ticktext=studies,
-            tickangle=-45,
+            tickangle=45,
             showgrid=False, zeroline=False,
-            side="top",
+            side="bottom",
         ),
         yaxis=dict(
             tickmode="array",
@@ -817,8 +902,13 @@ def _render_traffic_light(review_id, articles):
             autorange=False,
             range=[-0.5, n_domains - 0.5],
         ),
-        title=dict(text="Risk of Bias - Traffic Light Plot", x=0.5,
-                   font=dict(size=14, family="Arial")),
+        title=dict(
+            text="Risk of Bias — Traffic Light Plot",
+            x=0.5, y=1.0,
+            xanchor="center", yanchor="top",
+            font=dict(size=14, family="Arial"),
+            pad=dict(b=20),
+        ),
     )
 
     st.plotly_chart(fig, use_container_width=True, key=f"rob_tl_{review_id}")

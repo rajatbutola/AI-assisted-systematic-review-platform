@@ -226,7 +226,11 @@ class ArticleRepository:
             return {"saved": saved, "duplicates": duplicates}
  
     def save_full_texts(self, articles: List[Article]) -> int:
-        to_save = [a for a in articles if a.full_text and a.full_text.strip()]
+        # Exclude PDF: placeholder strings — only save actual extracted text
+        to_save = [a for a in articles
+                   if a.full_text
+                   and a.full_text.strip()
+                   and not a.full_text.startswith("PDF:")]
         if not to_save:
             return 0
         with get_connection() as conn:
@@ -584,7 +588,7 @@ class ScreeningRepository:
                             WHERE review_id=? AND pmid=? AND stage='full_text'
                         """, (review_id, pmid))
 
-                        
+
                 elif stage == "full_text":
                     # Reviewer changed S2 decision → clear stale S2 adjudication
                     conn.execute("""
