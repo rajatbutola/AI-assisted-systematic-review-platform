@@ -153,13 +153,39 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
                 prompt = prompt[:max_chars]
                 logger.warning("Prompt truncated to %d chars", max_chars)
     else:
-        # Non-GGUF backends: char-based truncation
-        max_chars = MAX_INPUT_TOKENS * 3
-        if len(prompt) > max_chars:
-            prompt = prompt[:max_chars]
-            logger.warning("Prompt truncated to %d chars for task '%s'", max_chars, task)
+        backend_type, model = load_model()
 
-    backend_type, model = load_model()
+        # Truncate prompt using exact token count to prevent llama.cpp crash.
+        # The C++ assert (i01 >= 0 && i01 < ne01) fires when token index
+        # exceeds the embedding matrix — caused by context overflow.
+        gen_cfg     = GENERATION_CONFIG[task]
+        max_out     = gen_cfg.get("max_tokens", 512)
+        # Safe input budget: context - output tokens - 64 token safety margin
+        max_in_tok  = N_CTX - max_out - 64
+
+        if backend_type == "gguf" and model is not None:
+            try:
+                tokens = model.tokenize(prompt.encode("utf-8"))
+                if len(tokens) > max_in_tok:
+                    tokens  = tokens[:max_in_tok]
+                    prompt  = model.detokenize(tokens).decode("utf-8", errors="ignore")
+                    logger.warning(
+                        "Prompt truncated to %d tokens (max_in=%d) for task '%s'",
+                        len(tokens), max_in_tok, task,
+                    )
+            except Exception as tok_err:
+                # Fallback: conservative char truncation (3 chars/token for medical)
+                logger.warning("Tokenizer failed (%s), using char fallback", tok_err)
+                max_chars = max_in_tok * 3
+                if len(prompt) > max_chars:
+                    prompt = prompt[:max_chars]
+                    logger.warning(
+                        "Prompt truncated to %d chars for task '%s'", max_chars, task)
+        else:
+            # Non-GGUF: char-based truncation
+            max_chars = max_in_tok * 3
+            if len(prompt) > max_chars:
+                prompt = prompt[:max_chars]
 
     try:
         if backend_type == "gguf":
@@ -188,8 +214,7 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
 
 def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
     """Run inference using llama-cpp-python (GGUF model).
-    Catches native C++ exceptions that llama-cpp-python surfaces as
-    RuntimeError or Exception to prevent Streamlit from crashing.
+    Catches native C++ exceptions to prevent Streamlit process crash.
     """
     try:
         response = llm(
@@ -206,10 +231,7 @@ def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
                                      "context", "kv cache", "invalid"]):
             logger.error("llama.cpp native crash caught: %s", e)
             raise RuntimeError(
-                "LLM context overflow — the input text is too long for the "
-                f"model's context window ({N_CTX} tokens). "
-                "Try reducing the number of articles analysed at once, "
-                "or increase N_CTX in config/settings.py."
+                f"LLM context overflow — input too long for {N_CTX} token window."
             ) from e
         raise
 

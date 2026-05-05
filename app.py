@@ -1515,8 +1515,6 @@ def _do_core_search(review_id, population, intervention, comparison,
     search_id = search_repo.create_search(review_id=review_id, query=query,
                                           n_results=len(articles), source_name="CORE")
     result    = article_repo.save_articles(articles, review_id, search_id)
-    st.success(f"✅ **{len(articles)}** CORE articles found | "
-               f"{result['saved']} new | {result['duplicates']} already in DB")
 
     # Auto-download and parse open-access CORE PDFs in background
     if _core_pdf_urls:
@@ -1546,7 +1544,8 @@ def _do_core_search(review_id, population, intervention, comparison,
             st.info(f"📄 **{_parsed_count}** CORE PDFs parsed and stored.")
 
     st.success(f"✅ **{len(articles)}** CORE articles found | "
-               f"{result['saved']} new | {result['duplicates']} already in DB")
+               f"{result['saved']} new | {result['duplicates']} already in DB"
+               + (f" | 📄 {_parsed_count} PDFs parsed" if _core_pdf_urls else ""))
 
     _store(review_id, "articles_CORE", articles)
     _store(review_id, "search_id_CORE", search_id)

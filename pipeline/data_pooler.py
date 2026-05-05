@@ -307,7 +307,44 @@ def extract_study_data(abstract: str, pmid: str = "",
         return StudyData(pmid=pmid, title=title,
                          primary_outcome_result=f"Extraction error: {e}")
 
+def extract_outcome_data(
+    abstract: str,
+    outcome_name: str,
+    outcome_type: str = "binary",
+    pmid: str = "",
+) -> Dict:
+    """
+    Targeted per-outcome extraction (Cochrane-compliant).
+    Asks LLM specifically for one outcome's N, effect, CI, event rates.
+    Returns dict ready for GRADE imprecision calculation.
+    """
+    from config.prompts import OUTCOME_EXTRACT_PROMPT
+    import json as _json
 
+    if not abstract or not abstract.strip():
+        return {"found": False, "n_participants": "NR",
+                "effect_estimate": "NR", "notes": "No abstract"}
+    try:
+        prompt = OUTCOME_EXTRACT_PROMPT.format(
+            outcome_name=outcome_name,
+            outcome_type=outcome_type,
+            abstract=abstract[:3000],
+        )
+        raw = run_inference(prompt, task="extraction")
+        # Strip markdown fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = _json.loads(raw.strip())
+        return result
+    except Exception as e:
+        logger.warning("extract_outcome_data failed PMID %s: %s", pmid, e)
+        return {"found": False, "n_participants": "NR",
+                "effect_estimate": "NR", "notes": str(e)}
+    
+    
 def _repair_json(text: str) -> str:
     """
     Attempt to repair truncated JSON so json.loads can recover partial data.

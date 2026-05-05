@@ -998,21 +998,26 @@ def _render_nos(nos) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tab_grade(review_id, articles):
+    from pipeline.data_pooler import extract_outcome_data
+    from pipeline.grade_assessor import (
+        assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI, CERTAINTY_MEANING,
+        GRADEAssessment, GRADEFactor,
+    )
+
     st.markdown('''<div class="sr-section-header">
       <div class="sr-section-icon" style="background:#F0FDF4;">📋</div>
       <div><h3 style="color:var(--ink,#0F172A);">GRADE Certainty of Evidence</h3>
       </div></div>''', unsafe_allow_html=True)
     st.caption(
-        "BMJ Core GRADE 2025. Separate assessments for RCTs and Observational studies. "
-        "Run ⚖️ Risk of Bias and 📊 Data Pooling first for best results."
+        "BMJ Core GRADE 2025 · Multiple outcomes · Separate assessment per study design group."
     )
     _render_ai_disclaimer()
 
-    with st.expander("ℹ️ GRADE certainty levels (BMJ Core GRADE 2025)", expanded=False):
+    with st.expander("ℹ️ GRADE methodology (BMJ Core GRADE 2025)", expanded=False):
         st.markdown("""
 | Symbol | Level | Meaning |
 |--------|-------|---------|
-| ⊕⊕⊕⊕ | **High** | Further research unlikely to change our confidence |
+| ⊕⊕⊕⊕ | **High** | Further research unlikely to change confidence |
 | ⊕⊕⊕◯ | **Moderate** | Further research likely to have important impact |
 | ⊕⊕◯◯ | **Low** | Further research very likely to change the estimate |
 | ⊕◯◯◯ | **Very Low** | Very little confidence in the effect estimate |
@@ -1032,17 +1037,15 @@ def _tab_grade(review_id, articles):
 """)
 
     # ── Split articles by study design ────────────────────────────────────────
-    rct_articles  = []
-    obs_articles  = []
-    unclassified  = []
-
+    rct_articles, obs_articles, unclassified = [], [], []
     for a in articles:
         clf = _get_cached(review_id, a["pmid"], "study_class")
         if clf is None:
             unclassified.append(a)
         elif hasattr(clf, "design"):
-            design_val = str(clf.design.value if hasattr(clf.design, "value")
-                             else clf.design).lower()
+            design_val = str(
+                clf.design.value if hasattr(clf.design, "value") else clf.design
+            ).lower()
             if design_val == "rct":
                 rct_articles.append(a)
             else:
@@ -1050,345 +1053,531 @@ def _tab_grade(review_id, articles):
         else:
             unclassified.append(a)
 
-    # Unclassified → use predominant design selected by user
     st.info(
         f"📊 **Study design breakdown:** "
         f"RCTs: **{len(rct_articles)}** · "
         f"Observational: **{len(obs_articles)}** · "
-        f"Unclassified: **{len(unclassified)}** "
-        f"(run Risk of Bias tab to classify)"
+        f"Unclassified: **{len(unclassified)}**"
     )
 
     if unclassified:
         dest = st.radio(
             "Assign unclassified studies to:",
             ["RCTs", "Observational studies", "Exclude from GRADE"],
-            horizontal=True,
-            key=f"grade_unclassified_{review_id}",
+            horizontal=True, key=f"grade_unclassified_{review_id}",
         )
-        if dest == "RCTs":
-            rct_articles += unclassified
-        elif dest == "Observational studies":
-            obs_articles += unclassified
+        if dest == "RCTs":              rct_articles += unclassified
+        elif dest == "Observational studies": obs_articles += unclassified
 
-    # ── Outcome configuration ──────────────────────────────────────────────────
-    st.markdown("#### Configure GRADE Assessment")
-    outcome_name = st.text_input(
-        "Outcome to grade",
-        value="Primary outcome",
-        help="e.g. 'Overall survival', 'Complete remission rate', 'Adverse events'",
-        key=f"grade_outcome_{review_id}",
+    # ── Outcome manager ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📝 Step 1 — Pre-specify Outcomes")
+    st.caption(
+        "Add all outcomes before running GRADE. "
+        "Consistent with PROSPERO registration and Cochrane guidelines."
     )
+
+    _out_key = f"grade_outcomes_{review_id}"
+    if _out_key not in st.session_state:
+        st.session_state[_out_key] = [
+            {"name": "Primary outcome", "type": "binary",
+             "followup": "", "importance": "Critical"}
+        ]
+
+    outcomes = st.session_state[_out_key]
+
+    # Render outcome rows
+    to_delete = None
+    for oi, out in enumerate(outcomes):
+        oc1, oc2, oc3, oc4, oc5 = st.columns([3, 2, 2, 2, 1])
+        outcomes[oi]["name"] = oc1.text_input(
+            "Outcome name", value=out["name"],
+            key=f"oname_{review_id}_{oi}",
+            label_visibility="collapsed",
+            placeholder="e.g. Overall survival")
+        outcomes[oi]["type"] = oc2.selectbox(
+            "Type", ["binary", "continuous", "time-to-event"],
+            index=["binary","continuous","time-to-event"].index(out.get("type","binary")),
+            key=f"otype_{review_id}_{oi}",
+            label_visibility="collapsed")
+        outcomes[oi]["followup"] = oc3.text_input(
+            "Follow-up", value=out.get("followup",""),
+            key=f"ofu_{review_id}_{oi}",
+            label_visibility="collapsed",
+            placeholder="e.g. 30 days")
+        outcomes[oi]["importance"] = oc4.selectbox(
+            "Importance", ["Critical", "Important", "Not important"],
+            index=["Critical","Important","Not important"].index(
+                out.get("importance","Critical")),
+            key=f"oimp_{review_id}_{oi}",
+            label_visibility="collapsed")
+        if oc5.button("🗑️", key=f"odel_{review_id}_{oi}") and len(outcomes) > 1:
+            to_delete = oi
+
+    if to_delete is not None:
+        outcomes.pop(to_delete)
+        st.rerun()
+
+    if st.button("➕ Add outcome", key=f"oadd_{review_id}"):
+        outcomes.append({"name":"", "type":"binary",
+                         "followup":"", "importance":"Important"})
+        st.rerun()
+
+    st.session_state[_out_key] = outcomes
+
+    # ── Per-outcome data extraction ────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📊 Step 2 — Extract & Verify Outcome Data")
+    st.caption(
+        "LLM extracts per-outcome data from each article. "
+        "Review and correct values before running GRADE."
+    )
+
+    _ext_key = f"grade_extracted_{review_id}"
+    if _ext_key not in st.session_state:
+        st.session_state[_ext_key] = {}
+    extracted = st.session_state[_ext_key]
+
+    col_ext, col_clr = st.columns([2, 1])
+    with col_ext:
+        if st.button("▶ Extract data for all outcomes",
+                     key=f"grade_extract_{review_id}", type="primary"):
+            _prog = st.progress(0, text="Extracting outcome data…")
+            _total = len(outcomes) * len(articles)
+            _done  = 0
+            for out in outcomes:
+                oname = out["name"]
+                otype = out["type"]
+                if oname not in extracted:
+                    extracted[oname] = {}
+                for a in articles:
+                    pmid = a["pmid"]
+                    if pmid not in extracted[oname]:
+                        abstract = a.get("abstract","")
+                        ft       = article_repo.get_full_text(pmid) or ""
+                        text     = ft[:3000] if ft else abstract
+                        result   = extract_outcome_data(
+                            text, oname, otype, pmid=pmid)
+                        extracted[oname][pmid] = result
+                    _done += 1
+                    _prog.progress(_done/_total,
+                                   text=f"Extracting: {oname} — {_done}/{_total}")
+            _prog.empty()
+            st.session_state[_ext_key] = extracted
+            st.rerun()
+    with col_clr:
+        if st.button("🔄 Clear extracted data",
+                     key=f"grade_ext_clr_{review_id}"):
+            st.session_state.pop(_ext_key, None)
+            st.rerun()
+
+    # Show extracted data per outcome for verification
+    for out in outcomes:
+        oname = out["name"]
+        odata = extracted.get(oname, {})
+        if not odata:
+            continue
+        with st.expander(
+            f"📋 {oname} ({out['type']}, {out.get('followup','')}) "
+            f"— {sum(1 for v in odata.values() if v.get('found'))} studies reporting",
+            expanded=False
+        ):
+            st.caption("Review and correct extracted values. "
+                       "Changes saved automatically.")
+            _edit_key = f"grade_edits_{review_id}_{oname}"
+            if _edit_key not in st.session_state:
+                st.session_state[_edit_key] = {}
+            edits = st.session_state[_edit_key]
+
+            for a in articles:
+                pmid  = a["pmid"]
+                title = (a.get("title") or "")[:60]
+                row   = odata.get(pmid, {})
+                if not row:
+                    continue
+                found = row.get("found", False)
+                ec1, ec2, ec3, ec4 = st.columns([3, 2, 2, 2])
+                ec1.markdown(
+                    f"**{title}**  "
+                    f"{'✅' if found else '❌ Not reported'}"
+                )
+                edits[f"{pmid}_n"]  = ec2.text_input(
+                    "N", value=edits.get(f"{pmid}_n",
+                        str(row.get("n_participants","NR"))),
+                    key=f"ge_n_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+                edits[f"{pmid}_eff"] = ec3.text_input(
+                    "Effect (95% CI)",
+                    value=edits.get(f"{pmid}_eff",
+                        str(row.get("effect_estimate","NR"))),
+                    key=f"ge_eff_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+                edits[f"{pmid}_fu"] = ec4.text_input(
+                    "Follow-up",
+                    value=edits.get(f"{pmid}_fu",
+                        str(row.get("follow_up", out.get("followup","NR")))),
+                    key=f"ge_fu_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+            st.session_state[_edit_key] = edits
+
+    # ── GRADE assessment ───────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 🏆 Step 3 — Run GRADE Assessment")
 
     grade_key = f"grade_{review_id}"
 
-    col_run, col_clr = st.columns([2, 1])
+    col_run, col_clr2 = st.columns([2, 1])
     with col_run:
         run_btn = st.button(
-            "▶ Run GRADE Assessment (both groups)",
+            "▶ Run GRADE for all outcomes (both groups)",
             type="primary", key="grade_run")
-    with col_clr:
-        if st.button("🔄 Clear GRADE", key="grade_clear"):
+    with col_clr2:
+        if st.button("🔄 Clear GRADE results", key="grade_clear"):
             st.session_state.pop(grade_key, None)
+            try:
+                ai_repo.save_analysis(
+                    f"review_{review_id}", "grade", {})
+            except Exception:
+                pass
             st.rerun()
 
     if run_btn:
-        results = {}
+        all_results = {}  # {outcome_name: {design_key: GRADEAssessment}}
 
-        def _run_group(group_articles, design_key, design_label):
-            if not group_articles:
-                return
-            rob2_list = [r for a in group_articles
-                         if (r := _get_cached(review_id, a["pmid"], "rob2")) is not None]
-            nos_list  = [n for a in group_articles
-                         if (n := _get_cached(review_id, a["pmid"], "nos"))  is not None]
-            pool_list = [row for a in group_articles
-                         if (sd := _get_cached(review_id, a["pmid"], "data_pool")) is not None
-                         for row in [sd.to_table_row()]]
+        for out in outcomes:
+            oname  = out["name"]
+            otype  = out["type"]
+            odata  = extracted.get(oname, {})
+            edits  = st.session_state.get(
+                f"grade_edits_{review_id}_{oname}", {})
 
-            if not rob2_list and not nos_list:
-                st.warning(
-                    f"⚠️ No Risk of Bias data for {design_label}. "
-                    "Run ⚖️ Risk of Bias tab first for accurate results. "
-                    "Proceeding with limited information."
-                )
+            # Build pooled data for this outcome using verified extractions
+            def _pool_for_outcome(group_arts):
+                rows = []
+                for a in group_arts:
+                    pmid = a["pmid"]
+                    row  = odata.get(pmid, {})
+                    n    = edits.get(f"{pmid}_n",
+                               row.get("n_participants","NR"))
+                    eff  = edits.get(f"{pmid}_eff",
+                               row.get("effect_estimate","NR"))
+                    rows.append({
+                        "Title":          (a.get("title",""))[:50],
+                        "Sample size":    n,
+                        "Primary Result": eff,
+                        "Study Design":   (a.get("source","") or ""),
+                    })
+                return rows
 
-            with st.spinner(f"Computing GRADE for {design_label}…"):
-                try:
-                    grade = assess_grade(
-                        rob2_assessments=rob2_list,
-                        nos_assessments=nos_list,
-                        pooled_data=pool_list,
-                        outcome=outcome_name,
-                        study_design=design_key,
-                    )
-                    results[design_key] = grade
-                except Exception as e:
-                    logger.error("GRADE %s failed: %s", design_label, e)
-                    st.error(f"GRADE error ({design_label}): {e}")
+            def _run_group(group_arts, design_key, design_label):
+                if not group_arts:
+                    return
+                rob2_list = [r for a in group_arts
+                             if (r := _get_cached(review_id, a["pmid"], "rob2"))
+                             is not None]
+                nos_list  = [n for a in group_arts
+                             if (n := _get_cached(review_id, a["pmid"], "nos"))
+                             is not None]
+                pool_list = _pool_for_outcome(group_arts)
 
-        if rct_articles:
-            _run_group(rct_articles,  "rct",           "RCTs")
-        if obs_articles:
-            _run_group(obs_articles,  "observational", "Observational studies")
+                with st.spinner(
+                    f"GRADE: {oname} — {design_label}…"
+                ):
+                    try:
+                        grade = assess_grade(
+                            rob2_assessments=rob2_list,
+                            nos_assessments=nos_list,
+                            pooled_data=pool_list,
+                            outcome=oname,
+                            study_design=design_key,
+                        )
+                        all_results.setdefault(oname, {})[design_key] = grade
+                    except Exception as e:
+                        logger.error("GRADE %s/%s: %s",
+                                     oname, design_label, e)
+                        st.error(f"GRADE error ({oname}/{design_label}): {e}")
 
-        if results:
-            st.session_state[grade_key] = results
-            # Persist to DB keyed by review (not per-article)
+            if rct_articles:
+                _run_group(rct_articles,  "rct",           "RCTs")
+            if obs_articles:
+                _run_group(obs_articles,  "observational", "Observational")
+
+        if all_results:
+            st.session_state[grade_key] = all_results
             try:
-                from dataclasses import asdict
-                serialisable = {k: asdict(v) for k, v in results.items()}
+                import dataclasses
+                serialisable = {
+                    oname: {dk: dataclasses.asdict(g)
+                            for dk, g in dmap.items()}
+                    for oname, dmap in all_results.items()
+                }
                 ai_repo.save_analysis(
                     f"review_{review_id}", "grade", serialisable)
             except Exception as e:
-                logger.warning("Could not persist GRADE to DB: %s", e)
+                logger.warning("Could not persist GRADE: %s", e)
 
-    # ── Display results ────────────────────────────────────────────────────────
+    # ── Restore from DB if needed ──────────────────────────────────────────────
     grade_results = st.session_state.get(grade_key)
     if not grade_results:
-        # Try restoring from DB
         raw_grade = ai_repo.get_analysis(f"review_{review_id}", "grade")
         if raw_grade and isinstance(raw_grade, dict):
             try:
-                from pipeline.grade_assessor import GRADEAssessment, GRADEFactor
-                import dataclasses
-
-                # All field names that hold a GRADEFactor
-                _factor_field_names = {
-                    f.name for f in dataclasses.fields(GRADEAssessment)
-                    if f.default_factory is not dataclasses.MISSING  # type: ignore
-                    or True
-                }
-                # Simpler: just try to construct GRADEFactor for any dict value
                 restored = {}
-                for design_key, gd in raw_grade.items():
-                    if not isinstance(gd, dict):
+                for oname, dmap in raw_grade.items():
+                    if not isinstance(dmap, dict):
                         continue
-                    kwargs = {}
-                    for k, v in gd.items():
-                        if isinstance(v, dict) and "direction" in v:
-                            # This is a GRADEFactor stored as dict
-                            kwargs[k] = GRADEFactor(**v)
-                        else:
-                            kwargs[k] = v
-                    restored[design_key] = GRADEAssessment(**kwargs)
+                    restored[oname] = {}
+                    for design_key, gd in dmap.items():
+                        if not isinstance(gd, dict):
+                            continue
+                        kwargs = {}
+                        for k, v in gd.items():
+                            if isinstance(v, dict) and "direction" in v:
+                                kwargs[k] = GRADEFactor(**v)
+                            else:
+                                kwargs[k] = v
+                        restored[oname][design_key] = GRADEAssessment(**kwargs)
                 grade_results = restored
                 st.session_state[grade_key] = grade_results
             except Exception as e:
-                logger.warning("Could not restore GRADE from DB: %s", e)
+                logger.warning("Could not restore GRADE: %s", e)
+
     if not grade_results:
         return
 
-    # ── Combined SoF table (matches BMJ 2025 / user example format) ───────────
+    # ── Combined SoF table — Cochrane format with outcome header rows ──────────
     st.divider()
-    st.markdown("#### 📋 Summary of Findings (SoF) Table — BMJ Core GRADE 2025")
+    st.markdown("#### 📋 Summary of Findings — BMJ Core GRADE 2025")
     st.caption(
-        "One row per study design group. "
-        "Certainty assessed separately for RCTs (start: High) and "
-        "Observational (start: Low)."
+        "One section per outcome · "
+        "One row per study design group · "
+        "Certainty assessed separately (RCTs start High, Observational start Low)"
     )
 
-    sof_rows = []
-    for design_key in ["rct", "observational"]:
-        g = grade_results.get(design_key)
-        if g:
-            sof_rows.append(g.to_sof_row())
+    # Streamlit preview table
+    preview_rows = []
+    for out in outcomes:
+        oname   = out["name"]
+        ofu     = out.get("followup","")
+        dmap    = grade_results.get(oname, {})
+        if not dmap:
+            continue
+        # Section header row
+        preview_rows.append({
+            "Outcome":        f"📌 {oname}" + (f" ({ofu})" if ofu else ""),
+            "Study design":   "—", "No. studies (N)": "—",
+            "Effect estimate":"—", "Risk of bias":"—",
+            "Inconsistency":  "—", "Indirectness":"—",
+            "Imprecision":    "—", "Publication bias":"—",
+            "Certainty":      "—",
+        })
+        for design_key in ["rct","observational"]:
+            g = dmap.get(design_key)
+            if g:
+                row = g.to_sof_row()
+                row["Outcome"] = ""  # blank — outcome shown in header
+                preview_rows.append(row)
 
-    if sof_rows:
-        sof_df = pd.DataFrame(sof_rows)
-        st.dataframe(sof_df, use_container_width=True, hide_index=True)
-        # ── Publication-quality HTML SoF table ────────────────────────────────
-        st.divider()
-        st.markdown("#### 📄 Summary of Findings (SoF) Table ")
+    if preview_rows:
+        st.dataframe(pd.DataFrame(preview_rows),
+                     use_container_width=True, hide_index=True)
 
-        # Manual event count override (fallback when data pooler couldn't extract)
-        with st.expander("✏️ Manual event count entry (if not auto-extracted)", expanded=False):
-            st.caption(
-                "If per-arm event counts were not extracted automatically, "
-                "enter them here. Format: events/total e.g. '19/266'"
-            )
-            _manual_events = st.session_state.get(f"manual_events_{review_id}", {})
-            for g_key, g_label in [("rct","RCTs"),("observational","Observational")]:
-                g = grade_results.get(g_key)
-                if not g: continue
-                st.markdown(f"**{g_label}**")
-                ec1, ec2 = st.columns(2)
-                _manual_events[f"{g_key}_int"] = ec1.text_input(
-                    "Events/N (intervention arm)",
-                    value=_manual_events.get(f"{g_key}_int",""),
-                    key=f"me_int_{g_key}_{review_id}",
+    # ── Manual event counts ────────────────────────────────────────────────────
+    _manual_ev = {}
+    with st.expander("✏️ Manual event count entry (if not auto-extracted)",
+                     expanded=False):
+        st.caption("Format: events/total e.g. '19/266'")
+        for out in outcomes:
+            oname = out["name"]
+            dmap  = grade_results.get(oname, {})
+            if not dmap: continue
+            st.markdown(f"**{oname}**")
+            for g_key, g_label in [("rct","RCTs"),
+                                    ("observational","Observational")]:
+                if g_key not in dmap: continue
+                mc1, mc2 = st.columns(2)
+                _manual_ev[f"{oname}_{g_key}_int"] = mc1.text_input(
+                    f"{g_label} — Intervention arm",
+                    key=f"me_int_{g_key}_{oname}_{review_id}",
                     placeholder="e.g. 19/266")
-                _manual_events[f"{g_key}_comp"] = ec2.text_input(
-                    "Events/N (comparator arm)",
-                    value=_manual_events.get(f"{g_key}_comp",""),
-                    key=f"me_comp_{g_key}_{review_id}",
+                _manual_ev[f"{oname}_{g_key}_comp"] = mc2.text_input(
+                    f"{g_label} — Comparator arm",
+                    key=f"me_comp_{g_key}_{oname}_{review_id}",
                     placeholder="e.g. 44/359")
-            st.session_state[f"manual_events_{review_id}"] = _manual_events
 
-        _manual_ev = st.session_state.get(f"manual_events_{review_id}", {})
-        sof_html = _build_sof_html(grade_results, _manual_ev)
-        st.markdown(sof_html, unsafe_allow_html=True)
+    # ── HTML SoF table (Cochrane publication quality) ─────────────────────────
+    sof_html = _build_sof_html_multi(grade_results, outcomes, _manual_ev)
+    st.markdown(sof_html, unsafe_allow_html=True)
 
-        # Download as HTML (opens in Word via File > Open)
-        sof_html_full = f"""<!DOCTYPE html><html><head>
+    sof_html_full = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8">
 <style>
-  body {{ font-family: Arial, sans-serif; font-size: 11pt; }}
+  body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 20px; }}
   table {{ border-collapse: collapse; width: 100%; }}
-  th {{ background: #1B4F8A; color: white; padding: 6px 8px;
-        text-align: center; font-size: 10pt; border: 1px solid #999; }}
-  td {{ padding: 5px 8px; border: 1px solid #ccc;
-        text-align: center; font-size: 10pt; vertical-align: middle; }}
-  .outcome-row {{ background:#1B4F8A; color:white; font-weight:bold;
-                  text-align:left; padding:6px 8px; }}
-  .certainty-high     {{ color:#1B5E20; font-weight:bold; }}
+  th {{ background:#1B4F8A; color:white; padding:6px 8px;
+        text-align:center; font-size:10pt; border:1px solid #999; }}
+  td {{ padding:5px 8px; border:1px solid #ccc;
+        text-align:center; font-size:10pt; vertical-align:middle; }}
+  .outcome-header {{ background:#2C3E50; color:white; font-weight:bold;
+                     text-align:left; font-size:11pt; }}
+  .certainty-high {{ color:#1B5E20; font-weight:bold; }}
   .certainty-moderate {{ color:#F57F17; font-weight:bold; }}
-  .certainty-low      {{ color:#E65100; font-weight:bold; }}
+  .certainty-low {{ color:#E65100; font-weight:bold; }}
   .certainty-very_low {{ color:#B71C1C; font-weight:bold; }}
 </style></head><body>{sof_html}</body></html>"""
+
+    c_dl1, c_dl2, c_dl3 = st.columns(3)
+    with c_dl1:
         st.download_button(
-            "📥 Download SoF table (HTML — opens in Word)",
+            "📥 Download SoF (HTML — opens in Word)",
             data=sof_html_full,
             file_name=f"sof_table_{review_id}.html",
-            mime="text/html",
-            use_container_width=True,
-        )
-
-        c1_, c2_ = st.columns(2)
-        with c1_:
+            mime="text/html", use_container_width=True)
+    with c_dl2:
+        all_rows = []
+        for out in outcomes:
+            dmap = grade_results.get(out["name"], {})
+            for g in dmap.values():
+                r = g.to_sof_row()
+                r["Outcome"] = out["name"]
+                all_rows.append(r)
+        if all_rows:
             st.download_button(
                 "📥 Export SoF (CSV)",
-                data=sof_df.to_csv(index=False),
+                data=pd.DataFrame(all_rows).to_csv(index=False),
                 file_name=f"grade_sof_{review_id}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with c2_:
-            combined_export = {k: g.to_export_dict()
-                               for k, g in grade_results.items()}
-            st.download_button(
-                "📥 Export Full GRADE (JSON)",
-                data=json.dumps(combined_export, indent=2),
-                file_name=f"grade_{review_id}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+                mime="text/csv", use_container_width=True)
+    with c_dl3:
+        combined_export = {
+            oname: {dk: g.to_export_dict() for dk, g in dmap.items()}
+            for oname, dmap in grade_results.items()
+        }
+        st.download_button(
+            "📥 Export Full GRADE (JSON)",
+            data=json.dumps(combined_export, indent=2),
+            file_name=f"grade_{review_id}.json",
+            mime="application/json", use_container_width=True)
 
-    # ── Per-group detailed breakdown ───────────────────────────────────────────
+    # ── Per-outcome detailed breakdown ─────────────────────────────────────────
     st.divider()
     st.markdown("#### Detailed Factor Breakdown")
 
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        grade = grade_results.get(design_key)
-        if not grade:
+    for out in outcomes:
+        oname = out["name"]
+        dmap  = grade_results.get(oname, {})
+        if not dmap:
             continue
+        st.markdown(f"##### 📌 {oname}")
+        for design_key, design_label in [
+            ("rct","RCTs"), ("observational","Observational")
+        ]:
+            grade = dmap.get(design_key)
+            if not grade:
+                continue
+            emoji   = CERTAINTY_EMOJI.get(grade.final_certainty, "⬜")
+            display = CERTAINTY_DISPLAY.get(grade.final_certainty,
+                                            grade.final_certainty)
+            with st.expander(
+                f"{emoji} **{design_label}** — {display} "
+                f"({grade.n_studies} studies, n={grade.n_participants or 'NR'})",
+                expanded=False,
+            ):
+                st.info(grade.certainty_meaning)
+                st.caption(f"Rationale: {grade.certainty_rationale}")
 
-        emoji   = CERTAINTY_EMOJI.get(grade.final_certainty, "⬜")
-        display = CERTAINTY_DISPLAY.get(grade.final_certainty, grade.final_certainty)
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Studies",      grade.n_studies)
+                mc2.metric("Participants", grade.n_participants or "NR")
+                mc3.metric("Starting",     grade.starting_certainty.upper())
+                mc4.metric("Final",
+                           grade.final_certainty.replace("_"," ").upper())
 
-        with st.expander(
-            f"{emoji} **{design_label}** — Certainty: **{display}** "
-            f"({grade.n_studies} studies, n={grade.n_participants or 'NR'})",
-            expanded=True
-        ):
-            st.info(grade.certainty_meaning)
-            st.caption(f"Rationale: {grade.certainty_rationale}")
+                st.markdown("**Downgrade / Upgrade Factors**")
+                factor_cols = st.columns(5)
+                for col, factor in zip(factor_cols, [
+                    grade.risk_of_bias, grade.inconsistency,
+                    grade.indirectness, grade.imprecision,
+                    grade.publication_bias,
+                ]):
+                    icon  = ("🔴" if factor.levels==2 else "🟡") \
+                            if factor.direction=="downgrade" else \
+                            ("🟢" if factor.direction=="upgrade" else "🟢")
+                    label = (f"↓{factor.levels}" if factor.direction=="downgrade"
+                             else f"↑{factor.levels}" if factor.direction=="upgrade"
+                             else "—")
+                    col.markdown(
+                        f"<div style='text-align:center'>"
+                        f"<small>{factor.name}</small><br>"
+                        f"<span style='font-size:1.3em'>{icon}</span><br>"
+                        f"<small>{label}</small></div>",
+                        unsafe_allow_html=True)
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Studies",      grade.n_studies)
-            mc2.metric("Participants", grade.n_participants or "NR")
-            mc3.metric("Starting",     grade.starting_certainty.upper())
-            mc4.metric("Final",        grade.final_certainty.replace("_"," ").upper())
+                with st.expander("🔍 Factor rationales", expanded=False):
+                    for f in grade.all_factors:
+                        if f.direction != "none" and f.rationale:
+                            st.markdown(
+                                f"**{f.name}** — "
+                                f"{'↓'*f.levels} Downgrade"
+                                if f.direction=="downgrade"
+                                else f"**{f.name}** — ↑ Upgrade")
+                            st.caption(f"  {f.rationale}")
 
-            st.markdown("**Downgrade / Upgrade Factors**")
-            factor_cols = st.columns(5)
-            shown_factors = [
-                grade.risk_of_bias, grade.inconsistency,
-                grade.indirectness, grade.imprecision, grade.publication_bias,
-            ]
-            for col, factor in zip(factor_cols, shown_factors):
-                if factor.direction == "downgrade":
-                    icon  = "🔴" if factor.levels == 2 else "🟡"
-                    label = f"↓{factor.levels}"
-                elif factor.direction == "upgrade":
-                    icon  = "🟢"; label = f"↑{factor.levels}"
-                else:
-                    icon  = "🟢"; label = "—"
-                col.markdown(
-                    f"<div style='text-align:center'>"
-                    f"<small>{factor.name}</small><br>"
-                    f"<span style='font-size:1.3em'>{icon}</span><br>"
-                    f"<small>{label}</small></div>",
-                    unsafe_allow_html=True,
+                # Reporting template
+                n_word = (
+                    f"{grade.n_studies} "
+                    f"{'randomised trial' if design_key=='rct' else 'observational stud'}"
+                    f"{'y' if grade.n_studies==1 else 'ies'}"
                 )
+                st.divider()
+                st.markdown("**📝 Reporting Template**")
+                st.code(
+                    f"The certainty of evidence for {grade.outcome} based on "
+                    f"{n_word} (n={grade.n_participants or 'NR'}) was assessed "
+                    f"using the GRADE approach (BMJ Core GRADE 2025). "
+                    f"The certainty was rated as "
+                    f"{grade.final_certainty.replace('_',' ')} "
+                    f"({CERTAINTY_DISPLAY.get(grade.final_certainty,'')}). "
+                    f"{grade.certainty_rationale}",
+                    language=None)
 
-            # Upgrade factors
-            upgrade_factors = [
-                grade.large_effect, grade.dose_response, grade.residual_confounding
-            ]
-            active_upgrades = [f for f in upgrade_factors if f.direction == "upgrade"]
-            if active_upgrades:
-                st.markdown("**Upgrade factors applied:**")
-                for f in active_upgrades:
-                    st.success(f"↑ {f.name}: {f.rationale}")
 
-            with st.expander("🔍 Factor rationales", expanded=False):
-                for f in grade.all_factors:
-                    if f.direction != "none" and f.rationale:
-                        dir_str = (f"{'↓'*f.levels} Downgrade"
-                                   if f.direction == "downgrade" else "↑ Upgrade")
-                        st.markdown(f"**{f.name}** — {dir_str}")
-                        st.caption(f"  {f.rationale}")
-
-            # Reporting template
-            st.divider()
-            st.markdown("**📝 Reporting Template**")
-            n_word = (f"{grade.n_studies} "
-                      f"{'randomised trial' if design_key=='rct' else 'observational stud'}"
-                      f"{'y' if grade.n_studies==1 else 'ies'}")
-            template = (
-                f"The certainty of evidence for {grade.outcome} based on {n_word} "
-                f"(n={grade.n_participants or 'NR'} participants) was assessed using "
-                f"the GRADE approach (BMJ Core GRADE 2025). "
-                f"The certainty was rated as **{grade.final_certainty.replace('_',' ')}** "
-                f"({CERTAINTY_DISPLAY.get(grade.final_certainty, '')}). "
-                f"{grade.certainty_rationale}"
-            )
-            st.code(template, language=None)
-
-def _build_sof_html(grade_results: dict, manual_events: dict = None) -> str:
+def _build_sof_html_multi(grade_results: dict,
+                           outcomes: list,
+                           manual_events: dict = None) -> str:
     """
-    Build a publication-quality HTML Summary of Findings table.
-    Matches Cochrane/BMJ format with merged headers and certainty symbols.
+    Cochrane-format multi-outcome SoF table.
+    Each outcome gets a dark header row followed by one data row per design group.
+    Matches the reference table format exactly.
     """
     if manual_events is None:
         manual_events = {}
 
-    CERTAINTY_SYMBOLS = {
-        "high":      "⊕⊕⊕⊕", "moderate": "⊕⊕⊕◯",
-        "low":       "⊕⊕◯◯",  "very_low": "⊕◯◯◯",
+    CERT_SYMBOLS = {
+        "high": "⊕⊕⊕⊕", "moderate": "⊕⊕⊕◯",
+        "low":  "⊕⊕◯◯",  "very_low": "⊕◯◯◯",
     }
-    CERTAINTY_COLORS = {
-        "high": "#1B5E20", "moderate": "#F57F17",
-        "low":  "#E65100", "very_low": "#B71C1C",
+    CERT_COLORS = {
+        "high":     "#1B5E20", "moderate": "#F57F17",
+        "low":      "#E65100", "very_low": "#B71C1C",
     }
 
-    def _fmt_factor(factor) -> str:
+    def _fmt(factor) -> str:
         if factor.direction == "downgrade":
-            return "⬇ Serious" if factor.levels == 1 else "⬇⬇ Very serious"
-        if factor.direction == "upgrade":
-            return "⬆ Upgrade"
+            return "⬇ Serious" if factor.levels==1 else "⬇⬇ Very serious"
+        if factor.direction == "upgrade": return "⬆ Upgrade"
         return "Not serious"
 
     html = """
 <table>
 <thead>
 <tr>
+  <th rowspan="2" style="text-align:left;min-width:160px;">
+    Outcome<br><small>(follow-up)</small></th>
   <th rowspan="2">Study design<br>(No. studies, N)</th>
   <th colspan="5" style="background:#2C5F8A;">Certainty assessment</th>
   <th colspan="2" style="background:#2C5F8A;">Study event rates</th>
   <th rowspan="2">Relative effect<br>(95% CI)</th>
-  <th rowspan="2">Overall certainty</th>
+  <th rowspan="2">Overall<br>certainty</th>
 </tr>
 <tr>
   <th>Risk of bias</th>
@@ -1403,56 +1592,83 @@ def _build_sof_html(grade_results: dict, manual_events: dict = None) -> str:
 <tbody>
 """
 
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        g = grade_results.get(design_key)
-        if not g:
+    footnotes = []
+
+    for out in outcomes:
+        oname = out["name"]
+        ofu   = out.get("followup", "")
+        dmap  = grade_results.get(oname, {})
+        if not dmap:
             continue
 
-        sym    = CERTAINTY_SYMBOLS.get(g.final_certainty, "")
-        color  = CERTAINTY_COLORS.get(g.final_certainty, "#000")
-        cert_display = f'<span style="color:{color};font-size:1.1em;">{sym}</span><br>' \
-                       f'<span style="color:{color};font-weight:bold;">' \
-                       f'{g.final_certainty.replace("_"," ").upper()}</span>'
+        n_rows = sum(1 for dk in ["rct","observational"] if dk in dmap)
 
-        # Events: try manual override first, then auto-extracted from pooled data
-        ev_int  = manual_events.get(f"{design_key}_int",  "NR")
-        ev_comp = manual_events.get(f"{design_key}_comp", "NR")
-
-        design_cell = (
-            f"<b>{design_label}</b><br>"
-            f"{g.n_studies} {'study' if g.n_studies==1 else 'studies'}, "
-            f"n={g.n_participants or 'NR'}"
-        )
-
+        # Outcome header row (dark background, spans all columns)
+        out_label = oname + (f" (follow-up: {ofu})" if ofu else "")
         html += f"""
 <tr>
-  <td style="text-align:left;">{design_cell}</td>
-  <td>{_fmt_factor(g.risk_of_bias)}</td>
-  <td>{_fmt_factor(g.inconsistency)}</td>
-  <td>{_fmt_factor(g.indirectness)}</td>
-  <td>{_fmt_factor(g.imprecision)}</td>
-  <td>{_fmt_factor(g.publication_bias)}</td>
-  <td>{ev_int if ev_int else 'NR'}</td>
-  <td>{ev_comp if ev_comp else 'NR'}</td>
-  <td style="text-align:center;">{g.relative_effect}</td>
-  <td style="text-align:center;">{cert_display}</td>
+  <td colspan="11" class="outcome-header"
+      style="background:#2C3E50;color:white;font-weight:bold;
+             text-align:left;padding:7px 10px;">
+    {out_label}
+  </td>
 </tr>
 """
 
+        for design_key, design_label in [("rct","RCTs"),
+                                          ("observational","Observational")]:
+            g = dmap.get(design_key)
+            if not g:
+                continue
+
+            sym   = CERT_SYMBOLS.get(g.final_certainty, "")
+            color = CERT_COLORS.get(g.final_certainty, "#000")
+            cert_cell = (
+                f'<span style="color:{color};font-size:1.1em;">{sym}</span><br>'
+                f'<span style="color:{color};font-weight:bold;">'
+                f'{g.final_certainty.replace("_"," ").upper()}</span>'
+            )
+
+            ev_int  = manual_events.get(f"{oname}_{design_key}_int",  "") or "NR"
+            ev_comp = manual_events.get(f"{oname}_{design_key}_comp", "") or "NR"
+
+            design_cell = (
+                f"<b>{'RCTs' if design_key=='rct' else 'Observational'}</b><br>"
+                f"{g.n_studies} study" if g.n_studies==1
+                else
+                f"<b>{'RCTs' if design_key=='rct' else 'Observational'}</b><br>"
+                f"{g.n_studies} studies, n={g.n_participants or 'NR'}"
+            )
+
+            html += f"""
+<tr>
+  <td style="text-align:left;color:#555;font-size:0.9em;">
+    {'Critical' if out.get('importance')=='Critical' else out.get('importance','')}</td>
+  <td style="text-align:left;">{design_cell}</td>
+  <td>{_fmt(g.risk_of_bias)}</td>
+  <td>{_fmt(g.inconsistency)}</td>
+  <td>{_fmt(g.indirectness)}</td>
+  <td>{_fmt(g.imprecision)}</td>
+  <td>{_fmt(g.publication_bias)}</td>
+  <td>{ev_int}</td>
+  <td>{ev_comp}</td>
+  <td style="text-align:center;">{g.relative_effect}</td>
+  <td style="text-align:center;">{cert_cell}</td>
+</tr>
+"""
+            # Collect footnotes
+            for f in g.all_factors:
+                if f.direction != "none" and f.rationale:
+                    footnotes.append(
+                        f"<b>{oname} — {'RCTs' if design_key=='rct' else 'Obs'} "
+                        f"— {f.name}:</b> {f.rationale}")
+
     html += "</tbody></table>"
 
-    # Footnotes
-    footnotes = []
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        g = grade_results.get(design_key)
-        if not g: continue
-        for f in g.all_factors:
-            if f.direction != "none" and f.rationale:
-                footnotes.append(f"<b>{design_label} — {f.name}:</b> {f.rationale}")
-
     if footnotes:
-        html += "<br><small><b>Explanations:</b><br>" + \
-                "<br>".join(f"• {fn}" for fn in footnotes) + "</small>"
+        html += ("<br><small><b>Explanations:</b><br>"
+                 + "<br>".join(f"• {fn}" for fn in footnotes)
+                 + "</small>")
 
     return html
 

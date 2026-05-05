@@ -2,9 +2,12 @@
 
 import re
 from typing import Optional
-
+import logging
 from config.prompts import RELEVANCE_SCORING_PROMPT
 from core.llm import run_inference
+
+logger = logging.getLogger(__name__)
+
 
 def score_relevance(abstract: str) -> Optional[float]:
     if not abstract.strip():
@@ -12,7 +15,7 @@ def score_relevance(abstract: str) -> Optional[float]:
 
     prompt = RELEVANCE_SCORING_PROMPT.format(abstract=abstract)
     raw_output = run_inference(prompt, task="scoring")
-    print(f"RAW SCORER OUTPUT: '{raw_output}'")  # Add this line
+    logger.debug("RAW SCORER OUTPUT: '%s'", raw_output)
     return parse_score(raw_output)
 
 def parse_score(text: str) -> Optional[float]:

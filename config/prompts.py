@@ -305,3 +305,25 @@ Use 'none' if no adjustment is needed. Use NI if impossible to judge from the in
 
 
 
+
+
+OUTCOME_EXTRACT_PROMPT = """You are a systematic review data extractor.
+Extract data for ONE SPECIFIC OUTCOME from this abstract.
+
+Outcome to extract: {outcome_name}
+Outcome type: {outcome_type}
+Abstract: {abstract}
+
+Return ONLY a JSON object with these exact keys:
+{{
+  "found": true or false,
+  "n_participants": "number of participants for this outcome (integer or NR)",
+  "effect_estimate": "effect estimate with 95% CI e.g. RR=0.78 (0.65-0.92) or MD=-1.2 (-2.1 to -0.3) or NR",
+  "event_rate_intervention": "events/N (%) in intervention arm e.g. 19/266 (7.1%) or NR",
+  "event_rate_comparator": "events/N (%) in comparator arm e.g. 44/359 (12.3%) or NR",
+  "follow_up": "follow-up duration for this outcome e.g. 30 days or NR",
+  "notes": "any important caveats about this outcome measurement"
+}}
+
+If the outcome is not reported in the abstract, set found to false and all other fields to NR.
+Return ONLY the JSON. No explanation."""
