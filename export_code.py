@@ -1,6 +1,6 @@
 import os
 
-OUTPUT_FILE = "project_dump.txt"
+OUTPUT_FILE = "project_dump_08052026.txt"
 EXCLUDE_DIRS = {".venv", "venv", "__pycache__", ".git"}
 
 def should_skip(path):

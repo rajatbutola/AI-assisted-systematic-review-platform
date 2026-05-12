@@ -343,8 +343,8 @@ def extract_outcome_data(
         logger.warning("extract_outcome_data failed PMID %s: %s", pmid, e)
         return {"found": False, "n_participants": "NR",
                 "effect_estimate": "NR", "notes": str(e)}
-    
-    
+
+
 def _repair_json(text: str) -> str:
     """
     Attempt to repair truncated JSON so json.loads can recover partial data.

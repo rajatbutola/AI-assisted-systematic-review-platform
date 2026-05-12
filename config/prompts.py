@@ -305,8 +305,6 @@ Use 'none' if no adjustment is needed. Use NI if impossible to judge from the in
 
 
 
-
-
 OUTCOME_EXTRACT_PROMPT = """You are a systematic review data extractor.
 Extract data for ONE SPECIFIC OUTCOME from this abstract.
 

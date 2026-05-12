@@ -1,6 +1,7 @@
 
 ===== .\app.py =====
 
+
 import logging
 import os
 import threading
@@ -1299,8 +1300,6 @@ def _do_core_search(review_id, population, intervention, comparison,
     search_id = search_repo.create_search(review_id=review_id, query=query,
                                           n_results=len(articles), source_name="CORE")
     result    = article_repo.save_articles(articles, review_id, search_id)
-    st.success(f"✅ **{len(articles)}** CORE articles found | "
-               f"{result['saved']} new | {result['duplicates']} already in DB")
 
     # Auto-download and parse open-access CORE PDFs in background
     if _core_pdf_urls:
@@ -1330,7 +1329,8 @@ def _do_core_search(review_id, population, intervention, comparison,
             st.info(f"📄 **{_parsed_count}** CORE PDFs parsed and stored.")
 
     st.success(f"✅ **{len(articles)}** CORE articles found | "
-               f"{result['saved']} new | {result['duplicates']} already in DB")
+               f"{result['saved']} new | {result['duplicates']} already in DB"
+               + (f" | 📄 {_parsed_count} PDFs parsed" if _core_pdf_urls else ""))
 
     _store(review_id, "articles_CORE", articles)
     _store(review_id, "search_id_CORE", search_id)
@@ -1702,83 +1702,7 @@ elif _active == "PRISMA":
     render_prisma_diagram(review_id)
 
 
-
-
-
-===== .\requirements.txt =====
-
-# requirement.txt
-
-# requirements.txt
-
-altair==5.5.0
-annotated-types==0.7.0
-anyio==4.12.1
-attrs==25.4.0
-biopython==1.85
-blinker==1.9.0
-cachetools==6.2.6
-certifi==2026.2.25
-charset-normalizer==3.4.6
-click==8.1.8
-exceptiongroup==1.3.1
-filelock==3.19.1
-fsspec==2025.10.0
-gitdb==4.0.12
-GitPython==3.1.46
-h11==0.16.0
-hf-xet==1.4.2
-httpcore==1.0.9
-httpx==0.28.1
-huggingface_hub==0.36.2
-idna==3.11
-Jinja2==3.1.6
-jsonschema==4.25.1
-jsonschema-specifications==2025.9.1
-MarkupSafe==3.0.3
-mpmath==1.3.0
-narwhals==2.18.0
-networkx==3.2.1
-numpy==1.26.4
-packaging==25.0
-pandas==2.3.3
-pillow==11.3.0
-plotly==6.6.0
-protobuf==6.33.5
-pyarrow==21.0.0
-pydantic==2.12.5
-pydantic_core==2.41.5
-pydeck==0.9.1
-python-dateutil==2.9.0.post0
-python-dotenv==1.2.1
-pytz==2026.1.post1
-PyYAML==6.0.3
-referencing==0.36.2
-regex==2026.1.15
-requests==2.32.5
-rpds-py==0.27.1
-safetensors==0.7.0
-sentencepiece==0.2.1
-six==1.17.0
-smmap==5.0.3
-streamlit==1.50.0
-sympy==1.14.0
-tenacity==9.1.2
-tokenizers==0.22.2
-toml==0.10.2
-torch==2.2.2
-tornado==6.5.5
-tqdm==4.67.3
-transformers==4.57.6
-typing-inspection==0.4.2
-typing_extensions==4.15.0
-tzdata==2025.3
-urllib3==2.6.3
-
 ===== .\config\prompts.py =====
-
-# ── Summarization ──────────────────────────────────────────────────────────────
-SUMMARIZATION_PROMPT = """Summarize the following research abstract in exactly 5 bullet points.
 
 Example of correct output format:
 • Study Design: Randomised controlled trial
@@ -1796,7 +1720,7 @@ Summary:
 •"""
 
 
-# ── PICO Extraction ────────────────────────────────────────────────────────────
+# ── PICO Extraction ──
 PICO_EXTRACTION_PROMPT = """Extract PICO elements from the abstract below.
 
 Return a single JSON object. No markdown, no explanation, no code fences.
@@ -1808,7 +1732,7 @@ Abstract:
 JSON:"""
 
 
-# ── Quality Assessment ─────────────────────────────────────────────────────────
+# ── Quality Assessment ──
 # CRITICAL FIX: Output plain integers, NOT JSON.
 # JSON template examples in prompts cause the model to echo "?" or copy
 # the template with embedded quotes, producing unparseable output.
@@ -2059,6 +1983,27 @@ Use 'none' if no adjustment is needed. Use NI if impossible to judge from the in
 
 
 
+
+OUTCOME_EXTRACT_PROMPT = """You are a systematic review data extractor.
+Extract data for ONE SPECIFIC OUTCOME from this abstract.
+
+Outcome to extract: {outcome_name}
+Outcome type: {outcome_type}
+Abstract: {abstract}
+
+Return ONLY a JSON object with these exact keys:
+{{
+  "found": true or false,
+  "n_participants": "number of participants for this outcome (integer or NR)",
+  "effect_estimate": "effect estimate with 95% CI e.g. RR=0.78 (0.65-0.92) or MD=-1.2 (-2.1 to -0.3) or NR",
+  "event_rate_intervention": "events/N (%) in intervention arm e.g. 19/266 (7.1%) or NR",
+  "event_rate_comparator": "events/N (%) in comparator arm e.g. 44/359 (12.3%) or NR",
+  "follow_up": "follow-up duration for this outcome e.g. 30 days or NR",
+  "notes": "any important caveats about this outcome measurement"
+}}
+
+If the outcome is not reported in the abstract, set found to false and all other fields to NR.
+Return ONLY the JSON. No explanation."""
 ===== .\config\settings.py =====
 
 # config/settings.py
@@ -3121,39 +3066,9 @@ class EuropePMCClient(BaseLiteratureClient):
         except Exception as e:
             logger.warning("Europe PMC parse failed: %s", e)
             return None
-===== .\core\llm.py =====
 
-#core/llm.py 25th March v1, 2026
-# core/llm.py  — v3  31st March
-#
-# ROOT CAUSE FIXES:
-#
-# FIX 1 — Transformers backend returns prompt + completion (return_full_text=True default)
-#   The HuggingFace text-generation pipeline includes the input prompt in its
-#   output by default. When displayed, the user sees the entire system prompt
-#   ("You are an expert systematic review methodologist...") followed by the
-#   actual summary. This was the cause of the "prompt leaking into summary" bug.
-#   Fix: pass return_full_text=False so the pipeline returns ONLY the generated
-#   text, not the prompt.
-#
-# FIX 2 — Extraction task prepended "{" causing double-brace JSON
-#   The original code had:
-#       if task == "extraction":
-#           text = "{" + text   # because prompt used to end with "{"
-#   The updated prompts (config/prompts.py) end with "JSON:" not "JSON:\n{".
-#   So the model starts its response with "{", and prepending another "{"
-#   creates "{{..." which is invalid JSON that json.loads() rejects.
-#   Fix: remove the prepend entirely. The JSON parser already searches for
-#   the first "{" in the text, so it handles any leading whitespace cleanly.
-#
-# FIX 3 — "scoring" task max_tokens=200 was set in GENERATION_CONFIG
-#   200 tokens is enough for a 7-field JSON object (~150 tokens). This is fine.
-#   But the stop tokens for "scoring" were ["\n\n"] which terminated the
-#   response after the first line of JSON. Fix: use no stop tokens for
-#   scoring/extraction so the full JSON object is generated.
-#
-# FIX 4 — Llama-cpp echo=False is correct, but transformers needs explicit handling
-#   Both backends now strip any accidental prompt echo from the output.
+
+===== .\core\llm.py =====
 
 import logging
 import os
@@ -3278,13 +3193,39 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
                 prompt = prompt[:max_chars]
                 logger.warning("Prompt truncated to %d chars", max_chars)
     else:
-        # Non-GGUF backends: char-based truncation
-        max_chars = MAX_INPUT_TOKENS * 3
-        if len(prompt) > max_chars:
-            prompt = prompt[:max_chars]
-            logger.warning("Prompt truncated to %d chars for task '%s'", max_chars, task)
+        backend_type, model = load_model()
 
-    backend_type, model = load_model()
+        # Truncate prompt using exact token count to prevent llama.cpp crash.
+        # The C++ assert (i01 >= 0 && i01 < ne01) fires when token index
+        # exceeds the embedding matrix — caused by context overflow.
+        gen_cfg     = GENERATION_CONFIG[task]
+        max_out     = gen_cfg.get("max_tokens", 512)
+        # Safe input budget: context - output tokens - 64 token safety margin
+        max_in_tok  = N_CTX - max_out - 64
+
+        if backend_type == "gguf" and model is not None:
+            try:
+                tokens = model.tokenize(prompt.encode("utf-8"))
+                if len(tokens) > max_in_tok:
+                    tokens  = tokens[:max_in_tok]
+                    prompt  = model.detokenize(tokens).decode("utf-8", errors="ignore")
+                    logger.warning(
+                        "Prompt truncated to %d tokens (max_in=%d) for task '%s'",
+                        len(tokens), max_in_tok, task,
+                    )
+            except Exception as tok_err:
+                # Fallback: conservative char truncation (3 chars/token for medical)
+                logger.warning("Tokenizer failed (%s), using char fallback", tok_err)
+                max_chars = max_in_tok * 3
+                if len(prompt) > max_chars:
+                    prompt = prompt[:max_chars]
+                    logger.warning(
+                        "Prompt truncated to %d chars for task '%s'", max_chars, task)
+        else:
+            # Non-GGUF: char-based truncation
+            max_chars = max_in_tok * 3
+            if len(prompt) > max_chars:
+                prompt = prompt[:max_chars]
 
     try:
         if backend_type == "gguf":
@@ -3313,8 +3254,7 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
 
 def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
     """Run inference using llama-cpp-python (GGUF model).
-    Catches native C++ exceptions that llama-cpp-python surfaces as
-    RuntimeError or Exception to prevent Streamlit from crashing.
+    Catches native C++ exceptions to prevent Streamlit process crash.
     """
     try:
         response = llm(
@@ -3331,10 +3271,7 @@ def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
                                      "context", "kv cache", "invalid"]):
             logger.error("llama.cpp native crash caught: %s", e)
             raise RuntimeError(
-                "LLM context overflow — the input text is too long for the "
-                f"model's context window ({N_CTX} tokens). "
-                "Try reducing the number of articles analysed at once, "
-                "or increase N_CTX in config/settings.py."
+                f"LLM context overflow — input too long for {N_CTX} token window."
             ) from e
         raise
 
@@ -4301,60 +4238,6 @@ class PubMedClient(BaseLiteratureClient):
 
 
 ===== .\core\pubmed_pmc_pipeline.py =====
-
-# core/pubmed_pmc_pipeline.py   v1 25th March, 2026
-# Two-step PubMed → PMC full-text pipeline.
-#
-# Step 1 (PubMed):    PubMedClient.search_and_fetch() → returns Article list
-#                     with abstract-level data.  Displayed in "PubMed" mode.
-#
-# Step 2 (PMC):       From the PubMed PMID list, identify which articles have
-#                     a corresponding PMC ID (using NCBI's elink API), then
-#                     fetch full-text XML via PMCClient only for those articles.
-#                     Displayed in "PMC Full-Text" mode.
-#
-# Design principles:
-#   - Modular: PubMedPMCPipeline is the only class other code needs to call.
-#   - Extensible: adding Scopus / Embase requires only a new adapter that
-#     produces a list of Article objects; the PMC check is database-agnostic
-#     as long as articles have a PMID.
-#   - Non-destructive: PubMed results are always returned fully; PMC is an
-#     *enrichment* layer that supplements, never replaces, PubMed data.
-
-# core/pubmed_pmc_pipeline.py   v2
-# 27th March
-
-
-# core/pubmed_pmc_pipeline.py  — v2 31st March
-#
-# FIX: PMC articles missed because NCBI elink returns a *list* of PMCIDs for
-# each PMID (one PMID can map to one PMCID), but the original code assumed a
-# parallel zip(ids_from, pmcids_found) which is WRONG.
-#
-# The correct elink JSON structure is:
-# {
-#   "linksets": [{
-#     "ids": ["34201565", "34110507", ...],   <-- ALL PMIDs in the batch
-#     "linksetdbs": [{
-#       "linkname": "pubmed_pmc",
-#       "links": ["8490188", "7954678", ...]  <-- PMCIDs, SAME ORDER as ids
-#     }]
-#   }]
-# }
-#
-# So ids[i] maps to links[i] — a positional 1:1 mapping when both lists have
-# the same length.  BUT elink only returns PMCIDs for articles that HAVE a PMC
-# entry; articles without PMC coverage are SKIPPED entirely, making the two
-# lists different lengths.  The zip() silently truncated.
-#
-# FIX: Use the "idcheckresult" / "linksetdbhistories" approach, OR use the
-# elink mode=llinks which returns per-PMID mappings explicitly.
-# The cleanest fix: switch to elink with "cmd=neighbor_score" or use
-# the efetch-based approach: POST each PMID to the elink endpoint
-# individually in batches, parsing per-PMID.
-#
-# We use the correct approach: send one PMID at a time (or small batches)
-# with retmode=json and parse the per-ID linksets properly.
 
 import logging
 import time
@@ -6079,7 +5962,44 @@ def extract_study_data(abstract: str, pmid: str = "",
         return StudyData(pmid=pmid, title=title,
                          primary_outcome_result=f"Extraction error: {e}")
 
+def extract_outcome_data(
+    abstract: str,
+    outcome_name: str,
+    outcome_type: str = "binary",
+    pmid: str = "",
+) -> Dict:
+    """
+    Targeted per-outcome extraction (Cochrane-compliant).
+    Asks LLM specifically for one outcome's N, effect, CI, event rates.
+    Returns dict ready for GRADE imprecision calculation.
+    """
+    from config.prompts import OUTCOME_EXTRACT_PROMPT
+    import json as _json
 
+    if not abstract or not abstract.strip():
+        return {"found": False, "n_participants": "NR",
+                "effect_estimate": "NR", "notes": "No abstract"}
+    try:
+        prompt = OUTCOME_EXTRACT_PROMPT.format(
+            outcome_name=outcome_name,
+            outcome_type=outcome_type,
+            abstract=abstract[:3000],
+        )
+        raw = run_inference(prompt, task="extraction")
+        # Strip markdown fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = _json.loads(raw.strip())
+        return result
+    except Exception as e:
+        logger.warning("extract_outcome_data failed PMID %s: %s", pmid, e)
+        return {"found": False, "n_participants": "NR",
+                "effect_estimate": "NR", "notes": str(e)}
+    
+    
 def _repair_json(text: str) -> str:
     """
     Attempt to repair truncated JSON so json.loads can recover partial data.
@@ -7520,9 +7440,12 @@ def _parse_plain_integers(text: str) -> QualityAssessment:
 
 import re
 from typing import Optional
-
+import logging
 from config.prompts import RELEVANCE_SCORING_PROMPT
 from core.llm import run_inference
+
+logger = logging.getLogger(__name__)
+
 
 def score_relevance(abstract: str) -> Optional[float]:
     if not abstract.strip():
@@ -7530,7 +7453,7 @@ def score_relevance(abstract: str) -> Optional[float]:
 
     prompt = RELEVANCE_SCORING_PROMPT.format(abstract=abstract)
     raw_output = run_inference(prompt, task="scoring")
-    print(f"RAW SCORER OUTPUT: '{raw_output}'")  # Add this line
+    logger.debug("RAW SCORER OUTPUT: '%s'", raw_output)
     return parse_score(raw_output)
 
 def parse_score(text: str) -> Optional[float]:
@@ -11352,21 +11275,26 @@ def _render_nos(nos) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tab_grade(review_id, articles):
+    from pipeline.data_pooler import extract_outcome_data
+    from pipeline.grade_assessor import (
+        assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI, CERTAINTY_MEANING,
+        GRADEAssessment, GRADEFactor,
+    )
+
     st.markdown('''<div class="sr-section-header">
       <div class="sr-section-icon" style="background:#F0FDF4;">📋</div>
       <div><h3 style="color:var(--ink,#0F172A);">GRADE Certainty of Evidence</h3>
       </div></div>''', unsafe_allow_html=True)
     st.caption(
-        "BMJ Core GRADE 2025. Separate assessments for RCTs and Observational studies. "
-        "Run ⚖️ Risk of Bias and 📊 Data Pooling first for best results."
+        "BMJ Core GRADE 2025 · Multiple outcomes · Separate assessment per study design group."
     )
     _render_ai_disclaimer()
 
-    with st.expander("ℹ️ GRADE certainty levels (BMJ Core GRADE 2025)", expanded=False):
+    with st.expander("ℹ️ GRADE methodology (BMJ Core GRADE 2025)", expanded=False):
         st.markdown("""
 | Symbol | Level | Meaning |
 |--------|-------|---------|
-| ⊕⊕⊕⊕ | **High** | Further research unlikely to change our confidence |
+| ⊕⊕⊕⊕ | **High** | Further research unlikely to change confidence |
 | ⊕⊕⊕◯ | **Moderate** | Further research likely to have important impact |
 | ⊕⊕◯◯ | **Low** | Further research very likely to change the estimate |
 | ⊕◯◯◯ | **Very Low** | Very little confidence in the effect estimate |
@@ -11386,17 +11314,15 @@ def _tab_grade(review_id, articles):
 """)
 
     # ── Split articles by study design ────────────────────────────────────────
-    rct_articles  = []
-    obs_articles  = []
-    unclassified  = []
-
+    rct_articles, obs_articles, unclassified = [], [], []
     for a in articles:
         clf = _get_cached(review_id, a["pmid"], "study_class")
         if clf is None:
             unclassified.append(a)
         elif hasattr(clf, "design"):
-            design_val = str(clf.design.value if hasattr(clf.design, "value")
-                             else clf.design).lower()
+            design_val = str(
+                clf.design.value if hasattr(clf.design, "value") else clf.design
+            ).lower()
             if design_val == "rct":
                 rct_articles.append(a)
             else:
@@ -11404,345 +11330,531 @@ def _tab_grade(review_id, articles):
         else:
             unclassified.append(a)
 
-    # Unclassified → use predominant design selected by user
     st.info(
         f"📊 **Study design breakdown:** "
         f"RCTs: **{len(rct_articles)}** · "
         f"Observational: **{len(obs_articles)}** · "
-        f"Unclassified: **{len(unclassified)}** "
-        f"(run Risk of Bias tab to classify)"
+        f"Unclassified: **{len(unclassified)}**"
     )
 
     if unclassified:
         dest = st.radio(
             "Assign unclassified studies to:",
             ["RCTs", "Observational studies", "Exclude from GRADE"],
-            horizontal=True,
-            key=f"grade_unclassified_{review_id}",
+            horizontal=True, key=f"grade_unclassified_{review_id}",
         )
-        if dest == "RCTs":
-            rct_articles += unclassified
-        elif dest == "Observational studies":
-            obs_articles += unclassified
+        if dest == "RCTs":              rct_articles += unclassified
+        elif dest == "Observational studies": obs_articles += unclassified
 
-    # ── Outcome configuration ──────────────────────────────────────────────────
-    st.markdown("#### Configure GRADE Assessment")
-    outcome_name = st.text_input(
-        "Outcome to grade",
-        value="Primary outcome",
-        help="e.g. 'Overall survival', 'Complete remission rate', 'Adverse events'",
-        key=f"grade_outcome_{review_id}",
+    # ── Outcome manager ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📝 Step 1 — Pre-specify Outcomes")
+    st.caption(
+        "Add all outcomes before running GRADE. "
+        "Consistent with PROSPERO registration and Cochrane guidelines."
     )
+
+    _out_key = f"grade_outcomes_{review_id}"
+    if _out_key not in st.session_state:
+        st.session_state[_out_key] = [
+            {"name": "Primary outcome", "type": "binary",
+             "followup": "", "importance": "Critical"}
+        ]
+
+    outcomes = st.session_state[_out_key]
+
+    # Render outcome rows
+    to_delete = None
+    for oi, out in enumerate(outcomes):
+        oc1, oc2, oc3, oc4, oc5 = st.columns([3, 2, 2, 2, 1])
+        outcomes[oi]["name"] = oc1.text_input(
+            "Outcome name", value=out["name"],
+            key=f"oname_{review_id}_{oi}",
+            label_visibility="collapsed",
+            placeholder="e.g. Overall survival")
+        outcomes[oi]["type"] = oc2.selectbox(
+            "Type", ["binary", "continuous", "time-to-event"],
+            index=["binary","continuous","time-to-event"].index(out.get("type","binary")),
+            key=f"otype_{review_id}_{oi}",
+            label_visibility="collapsed")
+        outcomes[oi]["followup"] = oc3.text_input(
+            "Follow-up", value=out.get("followup",""),
+            key=f"ofu_{review_id}_{oi}",
+            label_visibility="collapsed",
+            placeholder="e.g. 30 days")
+        outcomes[oi]["importance"] = oc4.selectbox(
+            "Importance", ["Critical", "Important", "Not important"],
+            index=["Critical","Important","Not important"].index(
+                out.get("importance","Critical")),
+            key=f"oimp_{review_id}_{oi}",
+            label_visibility="collapsed")
+        if oc5.button("🗑️", key=f"odel_{review_id}_{oi}") and len(outcomes) > 1:
+            to_delete = oi
+
+    if to_delete is not None:
+        outcomes.pop(to_delete)
+        st.rerun()
+
+    if st.button("➕ Add outcome", key=f"oadd_{review_id}"):
+        outcomes.append({"name":"", "type":"binary",
+                         "followup":"", "importance":"Important"})
+        st.rerun()
+
+    st.session_state[_out_key] = outcomes
+
+    # ── Per-outcome data extraction ────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📊 Step 2 — Extract & Verify Outcome Data")
+    st.caption(
+        "LLM extracts per-outcome data from each article. "
+        "Review and correct values before running GRADE."
+    )
+
+    _ext_key = f"grade_extracted_{review_id}"
+    if _ext_key not in st.session_state:
+        st.session_state[_ext_key] = {}
+    extracted = st.session_state[_ext_key]
+
+    col_ext, col_clr = st.columns([2, 1])
+    with col_ext:
+        if st.button("▶ Extract data for all outcomes",
+                     key=f"grade_extract_{review_id}", type="primary"):
+            _prog = st.progress(0, text="Extracting outcome data…")
+            _total = len(outcomes) * len(articles)
+            _done  = 0
+            for out in outcomes:
+                oname = out["name"]
+                otype = out["type"]
+                if oname not in extracted:
+                    extracted[oname] = {}
+                for a in articles:
+                    pmid = a["pmid"]
+                    if pmid not in extracted[oname]:
+                        abstract = a.get("abstract","")
+                        ft       = article_repo.get_full_text(pmid) or ""
+                        text     = ft[:3000] if ft else abstract
+                        result   = extract_outcome_data(
+                            text, oname, otype, pmid=pmid)
+                        extracted[oname][pmid] = result
+                    _done += 1
+                    _prog.progress(_done/_total,
+                                   text=f"Extracting: {oname} — {_done}/{_total}")
+            _prog.empty()
+            st.session_state[_ext_key] = extracted
+            st.rerun()
+    with col_clr:
+        if st.button("🔄 Clear extracted data",
+                     key=f"grade_ext_clr_{review_id}"):
+            st.session_state.pop(_ext_key, None)
+            st.rerun()
+
+    # Show extracted data per outcome for verification
+    for out in outcomes:
+        oname = out["name"]
+        odata = extracted.get(oname, {})
+        if not odata:
+            continue
+        with st.expander(
+            f"📋 {oname} ({out['type']}, {out.get('followup','')}) "
+            f"— {sum(1 for v in odata.values() if v.get('found'))} studies reporting",
+            expanded=False
+        ):
+            st.caption("Review and correct extracted values. "
+                       "Changes saved automatically.")
+            _edit_key = f"grade_edits_{review_id}_{oname}"
+            if _edit_key not in st.session_state:
+                st.session_state[_edit_key] = {}
+            edits = st.session_state[_edit_key]
+
+            for a in articles:
+                pmid  = a["pmid"]
+                title = (a.get("title") or "")[:60]
+                row   = odata.get(pmid, {})
+                if not row:
+                    continue
+                found = row.get("found", False)
+                ec1, ec2, ec3, ec4 = st.columns([3, 2, 2, 2])
+                ec1.markdown(
+                    f"**{title}**  "
+                    f"{'✅' if found else '❌ Not reported'}"
+                )
+                edits[f"{pmid}_n"]  = ec2.text_input(
+                    "N", value=edits.get(f"{pmid}_n",
+                        str(row.get("n_participants","NR"))),
+                    key=f"ge_n_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+                edits[f"{pmid}_eff"] = ec3.text_input(
+                    "Effect (95% CI)",
+                    value=edits.get(f"{pmid}_eff",
+                        str(row.get("effect_estimate","NR"))),
+                    key=f"ge_eff_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+                edits[f"{pmid}_fu"] = ec4.text_input(
+                    "Follow-up",
+                    value=edits.get(f"{pmid}_fu",
+                        str(row.get("follow_up", out.get("followup","NR")))),
+                    key=f"ge_fu_{review_id}_{oname}_{pmid}",
+                    label_visibility="collapsed")
+            st.session_state[_edit_key] = edits
+
+    # ── GRADE assessment ───────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 🏆 Step 3 — Run GRADE Assessment")
 
     grade_key = f"grade_{review_id}"
 
-    col_run, col_clr = st.columns([2, 1])
+    col_run, col_clr2 = st.columns([2, 1])
     with col_run:
         run_btn = st.button(
-            "▶ Run GRADE Assessment (both groups)",
+            "▶ Run GRADE for all outcomes (both groups)",
             type="primary", key="grade_run")
-    with col_clr:
-        if st.button("🔄 Clear GRADE", key="grade_clear"):
+    with col_clr2:
+        if st.button("🔄 Clear GRADE results", key="grade_clear"):
             st.session_state.pop(grade_key, None)
+            try:
+                ai_repo.save_analysis(
+                    f"review_{review_id}", "grade", {})
+            except Exception:
+                pass
             st.rerun()
 
     if run_btn:
-        results = {}
+        all_results = {}  # {outcome_name: {design_key: GRADEAssessment}}
 
-        def _run_group(group_articles, design_key, design_label):
-            if not group_articles:
-                return
-            rob2_list = [r for a in group_articles
-                         if (r := _get_cached(review_id, a["pmid"], "rob2")) is not None]
-            nos_list  = [n for a in group_articles
-                         if (n := _get_cached(review_id, a["pmid"], "nos"))  is not None]
-            pool_list = [row for a in group_articles
-                         if (sd := _get_cached(review_id, a["pmid"], "data_pool")) is not None
-                         for row in [sd.to_table_row()]]
+        for out in outcomes:
+            oname  = out["name"]
+            otype  = out["type"]
+            odata  = extracted.get(oname, {})
+            edits  = st.session_state.get(
+                f"grade_edits_{review_id}_{oname}", {})
 
-            if not rob2_list and not nos_list:
-                st.warning(
-                    f"⚠️ No Risk of Bias data for {design_label}. "
-                    "Run ⚖️ Risk of Bias tab first for accurate results. "
-                    "Proceeding with limited information."
-                )
+            # Build pooled data for this outcome using verified extractions
+            def _pool_for_outcome(group_arts):
+                rows = []
+                for a in group_arts:
+                    pmid = a["pmid"]
+                    row  = odata.get(pmid, {})
+                    n    = edits.get(f"{pmid}_n",
+                               row.get("n_participants","NR"))
+                    eff  = edits.get(f"{pmid}_eff",
+                               row.get("effect_estimate","NR"))
+                    rows.append({
+                        "Title":          (a.get("title",""))[:50],
+                        "Sample size":    n,
+                        "Primary Result": eff,
+                        "Study Design":   (a.get("source","") or ""),
+                    })
+                return rows
 
-            with st.spinner(f"Computing GRADE for {design_label}…"):
-                try:
-                    grade = assess_grade(
-                        rob2_assessments=rob2_list,
-                        nos_assessments=nos_list,
-                        pooled_data=pool_list,
-                        outcome=outcome_name,
-                        study_design=design_key,
-                    )
-                    results[design_key] = grade
-                except Exception as e:
-                    logger.error("GRADE %s failed: %s", design_label, e)
-                    st.error(f"GRADE error ({design_label}): {e}")
+            def _run_group(group_arts, design_key, design_label):
+                if not group_arts:
+                    return
+                rob2_list = [r for a in group_arts
+                             if (r := _get_cached(review_id, a["pmid"], "rob2"))
+                             is not None]
+                nos_list  = [n for a in group_arts
+                             if (n := _get_cached(review_id, a["pmid"], "nos"))
+                             is not None]
+                pool_list = _pool_for_outcome(group_arts)
 
-        if rct_articles:
-            _run_group(rct_articles,  "rct",           "RCTs")
-        if obs_articles:
-            _run_group(obs_articles,  "observational", "Observational studies")
+                with st.spinner(
+                    f"GRADE: {oname} — {design_label}…"
+                ):
+                    try:
+                        grade = assess_grade(
+                            rob2_assessments=rob2_list,
+                            nos_assessments=nos_list,
+                            pooled_data=pool_list,
+                            outcome=oname,
+                            study_design=design_key,
+                        )
+                        all_results.setdefault(oname, {})[design_key] = grade
+                    except Exception as e:
+                        logger.error("GRADE %s/%s: %s",
+                                     oname, design_label, e)
+                        st.error(f"GRADE error ({oname}/{design_label}): {e}")
 
-        if results:
-            st.session_state[grade_key] = results
-            # Persist to DB keyed by review (not per-article)
+            if rct_articles:
+                _run_group(rct_articles,  "rct",           "RCTs")
+            if obs_articles:
+                _run_group(obs_articles,  "observational", "Observational")
+
+        if all_results:
+            st.session_state[grade_key] = all_results
             try:
-                from dataclasses import asdict
-                serialisable = {k: asdict(v) for k, v in results.items()}
+                import dataclasses
+                serialisable = {
+                    oname: {dk: dataclasses.asdict(g)
+                            for dk, g in dmap.items()}
+                    for oname, dmap in all_results.items()
+                }
                 ai_repo.save_analysis(
                     f"review_{review_id}", "grade", serialisable)
             except Exception as e:
-                logger.warning("Could not persist GRADE to DB: %s", e)
+                logger.warning("Could not persist GRADE: %s", e)
 
-    # ── Display results ────────────────────────────────────────────────────────
+    # ── Restore from DB if needed ──────────────────────────────────────────────
     grade_results = st.session_state.get(grade_key)
     if not grade_results:
-        # Try restoring from DB
         raw_grade = ai_repo.get_analysis(f"review_{review_id}", "grade")
         if raw_grade and isinstance(raw_grade, dict):
             try:
-                from pipeline.grade_assessor import GRADEAssessment, GRADEFactor
-                import dataclasses
-
-                # All field names that hold a GRADEFactor
-                _factor_field_names = {
-                    f.name for f in dataclasses.fields(GRADEAssessment)
-                    if f.default_factory is not dataclasses.MISSING  # type: ignore
-                    or True
-                }
-                # Simpler: just try to construct GRADEFactor for any dict value
                 restored = {}
-                for design_key, gd in raw_grade.items():
-                    if not isinstance(gd, dict):
+                for oname, dmap in raw_grade.items():
+                    if not isinstance(dmap, dict):
                         continue
-                    kwargs = {}
-                    for k, v in gd.items():
-                        if isinstance(v, dict) and "direction" in v:
-                            # This is a GRADEFactor stored as dict
-                            kwargs[k] = GRADEFactor(**v)
-                        else:
-                            kwargs[k] = v
-                    restored[design_key] = GRADEAssessment(**kwargs)
+                    restored[oname] = {}
+                    for design_key, gd in dmap.items():
+                        if not isinstance(gd, dict):
+                            continue
+                        kwargs = {}
+                        for k, v in gd.items():
+                            if isinstance(v, dict) and "direction" in v:
+                                kwargs[k] = GRADEFactor(**v)
+                            else:
+                                kwargs[k] = v
+                        restored[oname][design_key] = GRADEAssessment(**kwargs)
                 grade_results = restored
                 st.session_state[grade_key] = grade_results
             except Exception as e:
-                logger.warning("Could not restore GRADE from DB: %s", e)
+                logger.warning("Could not restore GRADE: %s", e)
+
     if not grade_results:
         return
 
-    # ── Combined SoF table (matches BMJ 2025 / user example format) ───────────
+    # ── Combined SoF table — Cochrane format with outcome header rows ──────────
     st.divider()
-    st.markdown("#### 📋 Summary of Findings (SoF) Table — BMJ Core GRADE 2025")
+    st.markdown("#### 📋 Summary of Findings — BMJ Core GRADE 2025")
     st.caption(
-        "One row per study design group. "
-        "Certainty assessed separately for RCTs (start: High) and "
-        "Observational (start: Low)."
+        "One section per outcome · "
+        "One row per study design group · "
+        "Certainty assessed separately (RCTs start High, Observational start Low)"
     )
 
-    sof_rows = []
-    for design_key in ["rct", "observational"]:
-        g = grade_results.get(design_key)
-        if g:
-            sof_rows.append(g.to_sof_row())
+    # Streamlit preview table
+    preview_rows = []
+    for out in outcomes:
+        oname   = out["name"]
+        ofu     = out.get("followup","")
+        dmap    = grade_results.get(oname, {})
+        if not dmap:
+            continue
+        # Section header row
+        preview_rows.append({
+            "Outcome":        f"📌 {oname}" + (f" ({ofu})" if ofu else ""),
+            "Study design":   "—", "No. studies (N)": "—",
+            "Effect estimate":"—", "Risk of bias":"—",
+            "Inconsistency":  "—", "Indirectness":"—",
+            "Imprecision":    "—", "Publication bias":"—",
+            "Certainty":      "—",
+        })
+        for design_key in ["rct","observational"]:
+            g = dmap.get(design_key)
+            if g:
+                row = g.to_sof_row()
+                row["Outcome"] = ""  # blank — outcome shown in header
+                preview_rows.append(row)
 
-    if sof_rows:
-        sof_df = pd.DataFrame(sof_rows)
-        st.dataframe(sof_df, use_container_width=True, hide_index=True)
-        # ── Publication-quality HTML SoF table ────────────────────────────────
-        st.divider()
-        st.markdown("#### 📄 Summary of Findings (SoF) Table ")
+    if preview_rows:
+        st.dataframe(pd.DataFrame(preview_rows),
+                     use_container_width=True, hide_index=True)
 
-        # Manual event count override (fallback when data pooler couldn't extract)
-        with st.expander("✏️ Manual event count entry (if not auto-extracted)", expanded=False):
-            st.caption(
-                "If per-arm event counts were not extracted automatically, "
-                "enter them here. Format: events/total e.g. '19/266'"
-            )
-            _manual_events = st.session_state.get(f"manual_events_{review_id}", {})
-            for g_key, g_label in [("rct","RCTs"),("observational","Observational")]:
-                g = grade_results.get(g_key)
-                if not g: continue
-                st.markdown(f"**{g_label}**")
-                ec1, ec2 = st.columns(2)
-                _manual_events[f"{g_key}_int"] = ec1.text_input(
-                    "Events/N (intervention arm)",
-                    value=_manual_events.get(f"{g_key}_int",""),
-                    key=f"me_int_{g_key}_{review_id}",
+    # ── Manual event counts ────────────────────────────────────────────────────
+    _manual_ev = {}
+    with st.expander("✏️ Manual event count entry (if not auto-extracted)",
+                     expanded=False):
+        st.caption("Format: events/total e.g. '19/266'")
+        for out in outcomes:
+            oname = out["name"]
+            dmap  = grade_results.get(oname, {})
+            if not dmap: continue
+            st.markdown(f"**{oname}**")
+            for g_key, g_label in [("rct","RCTs"),
+                                    ("observational","Observational")]:
+                if g_key not in dmap: continue
+                mc1, mc2 = st.columns(2)
+                _manual_ev[f"{oname}_{g_key}_int"] = mc1.text_input(
+                    f"{g_label} — Intervention arm",
+                    key=f"me_int_{g_key}_{oname}_{review_id}",
                     placeholder="e.g. 19/266")
-                _manual_events[f"{g_key}_comp"] = ec2.text_input(
-                    "Events/N (comparator arm)",
-                    value=_manual_events.get(f"{g_key}_comp",""),
-                    key=f"me_comp_{g_key}_{review_id}",
+                _manual_ev[f"{oname}_{g_key}_comp"] = mc2.text_input(
+                    f"{g_label} — Comparator arm",
+                    key=f"me_comp_{g_key}_{oname}_{review_id}",
                     placeholder="e.g. 44/359")
-            st.session_state[f"manual_events_{review_id}"] = _manual_events
 
-        _manual_ev = st.session_state.get(f"manual_events_{review_id}", {})
-        sof_html = _build_sof_html(grade_results, _manual_ev)
-        st.markdown(sof_html, unsafe_allow_html=True)
+    # ── HTML SoF table (Cochrane publication quality) ─────────────────────────
+    sof_html = _build_sof_html_multi(grade_results, outcomes, _manual_ev)
+    st.markdown(sof_html, unsafe_allow_html=True)
 
-        # Download as HTML (opens in Word via File > Open)
-        sof_html_full = f"""<!DOCTYPE html><html><head>
+    sof_html_full = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8">
 <style>
-  body {{ font-family: Arial, sans-serif; font-size: 11pt; }}
+  body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 20px; }}
   table {{ border-collapse: collapse; width: 100%; }}
-  th {{ background: #1B4F8A; color: white; padding: 6px 8px;
-        text-align: center; font-size: 10pt; border: 1px solid #999; }}
-  td {{ padding: 5px 8px; border: 1px solid #ccc;
-        text-align: center; font-size: 10pt; vertical-align: middle; }}
-  .outcome-row {{ background:#1B4F8A; color:white; font-weight:bold;
-                  text-align:left; padding:6px 8px; }}
-  .certainty-high     {{ color:#1B5E20; font-weight:bold; }}
+  th {{ background:#1B4F8A; color:white; padding:6px 8px;
+        text-align:center; font-size:10pt; border:1px solid #999; }}
+  td {{ padding:5px 8px; border:1px solid #ccc;
+        text-align:center; font-size:10pt; vertical-align:middle; }}
+  .outcome-header {{ background:#2C3E50; color:white; font-weight:bold;
+                     text-align:left; font-size:11pt; }}
+  .certainty-high {{ color:#1B5E20; font-weight:bold; }}
   .certainty-moderate {{ color:#F57F17; font-weight:bold; }}
-  .certainty-low      {{ color:#E65100; font-weight:bold; }}
+  .certainty-low {{ color:#E65100; font-weight:bold; }}
   .certainty-very_low {{ color:#B71C1C; font-weight:bold; }}
 </style></head><body>{sof_html}</body></html>"""
+
+    c_dl1, c_dl2, c_dl3 = st.columns(3)
+    with c_dl1:
         st.download_button(
-            "📥 Download SoF table (HTML — opens in Word)",
+            "📥 Download SoF (HTML — opens in Word)",
             data=sof_html_full,
             file_name=f"sof_table_{review_id}.html",
-            mime="text/html",
-            use_container_width=True,
-        )
-
-        c1_, c2_ = st.columns(2)
-        with c1_:
+            mime="text/html", use_container_width=True)
+    with c_dl2:
+        all_rows = []
+        for out in outcomes:
+            dmap = grade_results.get(out["name"], {})
+            for g in dmap.values():
+                r = g.to_sof_row()
+                r["Outcome"] = out["name"]
+                all_rows.append(r)
+        if all_rows:
             st.download_button(
                 "📥 Export SoF (CSV)",
-                data=sof_df.to_csv(index=False),
+                data=pd.DataFrame(all_rows).to_csv(index=False),
                 file_name=f"grade_sof_{review_id}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with c2_:
-            combined_export = {k: g.to_export_dict()
-                               for k, g in grade_results.items()}
-            st.download_button(
-                "📥 Export Full GRADE (JSON)",
-                data=json.dumps(combined_export, indent=2),
-                file_name=f"grade_{review_id}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+                mime="text/csv", use_container_width=True)
+    with c_dl3:
+        combined_export = {
+            oname: {dk: g.to_export_dict() for dk, g in dmap.items()}
+            for oname, dmap in grade_results.items()
+        }
+        st.download_button(
+            "📥 Export Full GRADE (JSON)",
+            data=json.dumps(combined_export, indent=2),
+            file_name=f"grade_{review_id}.json",
+            mime="application/json", use_container_width=True)
 
-    # ── Per-group detailed breakdown ───────────────────────────────────────────
+    # ── Per-outcome detailed breakdown ─────────────────────────────────────────
     st.divider()
     st.markdown("#### Detailed Factor Breakdown")
 
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        grade = grade_results.get(design_key)
-        if not grade:
+    for out in outcomes:
+        oname = out["name"]
+        dmap  = grade_results.get(oname, {})
+        if not dmap:
             continue
+        st.markdown(f"##### 📌 {oname}")
+        for design_key, design_label in [
+            ("rct","RCTs"), ("observational","Observational")
+        ]:
+            grade = dmap.get(design_key)
+            if not grade:
+                continue
+            emoji   = CERTAINTY_EMOJI.get(grade.final_certainty, "⬜")
+            display = CERTAINTY_DISPLAY.get(grade.final_certainty,
+                                            grade.final_certainty)
+            with st.expander(
+                f"{emoji} **{design_label}** — {display} "
+                f"({grade.n_studies} studies, n={grade.n_participants or 'NR'})",
+                expanded=False,
+            ):
+                st.info(grade.certainty_meaning)
+                st.caption(f"Rationale: {grade.certainty_rationale}")
 
-        emoji   = CERTAINTY_EMOJI.get(grade.final_certainty, "⬜")
-        display = CERTAINTY_DISPLAY.get(grade.final_certainty, grade.final_certainty)
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Studies",      grade.n_studies)
+                mc2.metric("Participants", grade.n_participants or "NR")
+                mc3.metric("Starting",     grade.starting_certainty.upper())
+                mc4.metric("Final",
+                           grade.final_certainty.replace("_"," ").upper())
 
-        with st.expander(
-            f"{emoji} **{design_label}** — Certainty: **{display}** "
-            f"({grade.n_studies} studies, n={grade.n_participants or 'NR'})",
-            expanded=True
-        ):
-            st.info(grade.certainty_meaning)
-            st.caption(f"Rationale: {grade.certainty_rationale}")
+                st.markdown("**Downgrade / Upgrade Factors**")
+                factor_cols = st.columns(5)
+                for col, factor in zip(factor_cols, [
+                    grade.risk_of_bias, grade.inconsistency,
+                    grade.indirectness, grade.imprecision,
+                    grade.publication_bias,
+                ]):
+                    icon  = ("🔴" if factor.levels==2 else "🟡") \
+                            if factor.direction=="downgrade" else \
+                            ("🟢" if factor.direction=="upgrade" else "🟢")
+                    label = (f"↓{factor.levels}" if factor.direction=="downgrade"
+                             else f"↑{factor.levels}" if factor.direction=="upgrade"
+                             else "—")
+                    col.markdown(
+                        f"<div style='text-align:center'>"
+                        f"<small>{factor.name}</small><br>"
+                        f"<span style='font-size:1.3em'>{icon}</span><br>"
+                        f"<small>{label}</small></div>",
+                        unsafe_allow_html=True)
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Studies",      grade.n_studies)
-            mc2.metric("Participants", grade.n_participants or "NR")
-            mc3.metric("Starting",     grade.starting_certainty.upper())
-            mc4.metric("Final",        grade.final_certainty.replace("_"," ").upper())
+                with st.expander("🔍 Factor rationales", expanded=False):
+                    for f in grade.all_factors:
+                        if f.direction != "none" and f.rationale:
+                            st.markdown(
+                                f"**{f.name}** — "
+                                f"{'↓'*f.levels} Downgrade"
+                                if f.direction=="downgrade"
+                                else f"**{f.name}** — ↑ Upgrade")
+                            st.caption(f"  {f.rationale}")
 
-            st.markdown("**Downgrade / Upgrade Factors**")
-            factor_cols = st.columns(5)
-            shown_factors = [
-                grade.risk_of_bias, grade.inconsistency,
-                grade.indirectness, grade.imprecision, grade.publication_bias,
-            ]
-            for col, factor in zip(factor_cols, shown_factors):
-                if factor.direction == "downgrade":
-                    icon  = "🔴" if factor.levels == 2 else "🟡"
-                    label = f"↓{factor.levels}"
-                elif factor.direction == "upgrade":
-                    icon  = "🟢"; label = f"↑{factor.levels}"
-                else:
-                    icon  = "🟢"; label = "—"
-                col.markdown(
-                    f"<div style='text-align:center'>"
-                    f"<small>{factor.name}</small><br>"
-                    f"<span style='font-size:1.3em'>{icon}</span><br>"
-                    f"<small>{label}</small></div>",
-                    unsafe_allow_html=True,
+                # Reporting template
+                n_word = (
+                    f"{grade.n_studies} "
+                    f"{'randomised trial' if design_key=='rct' else 'observational stud'}"
+                    f"{'y' if grade.n_studies==1 else 'ies'}"
                 )
+                st.divider()
+                st.markdown("**📝 Reporting Template**")
+                st.code(
+                    f"The certainty of evidence for {grade.outcome} based on "
+                    f"{n_word} (n={grade.n_participants or 'NR'}) was assessed "
+                    f"using the GRADE approach (BMJ Core GRADE 2025). "
+                    f"The certainty was rated as "
+                    f"{grade.final_certainty.replace('_',' ')} "
+                    f"({CERTAINTY_DISPLAY.get(grade.final_certainty,'')}). "
+                    f"{grade.certainty_rationale}",
+                    language=None)
 
-            # Upgrade factors
-            upgrade_factors = [
-                grade.large_effect, grade.dose_response, grade.residual_confounding
-            ]
-            active_upgrades = [f for f in upgrade_factors if f.direction == "upgrade"]
-            if active_upgrades:
-                st.markdown("**Upgrade factors applied:**")
-                for f in active_upgrades:
-                    st.success(f"↑ {f.name}: {f.rationale}")
 
-            with st.expander("🔍 Factor rationales", expanded=False):
-                for f in grade.all_factors:
-                    if f.direction != "none" and f.rationale:
-                        dir_str = (f"{'↓'*f.levels} Downgrade"
-                                   if f.direction == "downgrade" else "↑ Upgrade")
-                        st.markdown(f"**{f.name}** — {dir_str}")
-                        st.caption(f"  {f.rationale}")
-
-            # Reporting template
-            st.divider()
-            st.markdown("**📝 Reporting Template**")
-            n_word = (f"{grade.n_studies} "
-                      f"{'randomised trial' if design_key=='rct' else 'observational stud'}"
-                      f"{'y' if grade.n_studies==1 else 'ies'}")
-            template = (
-                f"The certainty of evidence for {grade.outcome} based on {n_word} "
-                f"(n={grade.n_participants or 'NR'} participants) was assessed using "
-                f"the GRADE approach (BMJ Core GRADE 2025). "
-                f"The certainty was rated as **{grade.final_certainty.replace('_',' ')}** "
-                f"({CERTAINTY_DISPLAY.get(grade.final_certainty, '')}). "
-                f"{grade.certainty_rationale}"
-            )
-            st.code(template, language=None)
-
-def _build_sof_html(grade_results: dict, manual_events: dict = None) -> str:
+def _build_sof_html_multi(grade_results: dict,
+                           outcomes: list,
+                           manual_events: dict = None) -> str:
     """
-    Build a publication-quality HTML Summary of Findings table.
-    Matches Cochrane/BMJ format with merged headers and certainty symbols.
+    Cochrane-format multi-outcome SoF table.
+    Each outcome gets a dark header row followed by one data row per design group.
+    Matches the reference table format exactly.
     """
     if manual_events is None:
         manual_events = {}
 
-    CERTAINTY_SYMBOLS = {
-        "high":      "⊕⊕⊕⊕", "moderate": "⊕⊕⊕◯",
-        "low":       "⊕⊕◯◯",  "very_low": "⊕◯◯◯",
+    CERT_SYMBOLS = {
+        "high": "⊕⊕⊕⊕", "moderate": "⊕⊕⊕◯",
+        "low":  "⊕⊕◯◯",  "very_low": "⊕◯◯◯",
     }
-    CERTAINTY_COLORS = {
-        "high": "#1B5E20", "moderate": "#F57F17",
-        "low":  "#E65100", "very_low": "#B71C1C",
+    CERT_COLORS = {
+        "high":     "#1B5E20", "moderate": "#F57F17",
+        "low":      "#E65100", "very_low": "#B71C1C",
     }
 
-    def _fmt_factor(factor) -> str:
+    def _fmt(factor) -> str:
         if factor.direction == "downgrade":
-            return "⬇ Serious" if factor.levels == 1 else "⬇⬇ Very serious"
-        if factor.direction == "upgrade":
-            return "⬆ Upgrade"
+            return "⬇ Serious" if factor.levels==1 else "⬇⬇ Very serious"
+        if factor.direction == "upgrade": return "⬆ Upgrade"
         return "Not serious"
 
     html = """
 <table>
 <thead>
 <tr>
+  <th rowspan="2" style="text-align:left;min-width:160px;">
+    Outcome<br><small>(follow-up)</small></th>
   <th rowspan="2">Study design<br>(No. studies, N)</th>
   <th colspan="5" style="background:#2C5F8A;">Certainty assessment</th>
   <th colspan="2" style="background:#2C5F8A;">Study event rates</th>
   <th rowspan="2">Relative effect<br>(95% CI)</th>
-  <th rowspan="2">Overall certainty</th>
+  <th rowspan="2">Overall<br>certainty</th>
 </tr>
 <tr>
   <th>Risk of bias</th>
@@ -11757,56 +11869,83 @@ def _build_sof_html(grade_results: dict, manual_events: dict = None) -> str:
 <tbody>
 """
 
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        g = grade_results.get(design_key)
-        if not g:
+    footnotes = []
+
+    for out in outcomes:
+        oname = out["name"]
+        ofu   = out.get("followup", "")
+        dmap  = grade_results.get(oname, {})
+        if not dmap:
             continue
 
-        sym    = CERTAINTY_SYMBOLS.get(g.final_certainty, "")
-        color  = CERTAINTY_COLORS.get(g.final_certainty, "#000")
-        cert_display = f'<span style="color:{color};font-size:1.1em;">{sym}</span><br>' \
-                       f'<span style="color:{color};font-weight:bold;">' \
-                       f'{g.final_certainty.replace("_"," ").upper()}</span>'
+        n_rows = sum(1 for dk in ["rct","observational"] if dk in dmap)
 
-        # Events: try manual override first, then auto-extracted from pooled data
-        ev_int  = manual_events.get(f"{design_key}_int",  "NR")
-        ev_comp = manual_events.get(f"{design_key}_comp", "NR")
-
-        design_cell = (
-            f"<b>{design_label}</b><br>"
-            f"{g.n_studies} {'study' if g.n_studies==1 else 'studies'}, "
-            f"n={g.n_participants or 'NR'}"
-        )
-
+        # Outcome header row (dark background, spans all columns)
+        out_label = oname + (f" (follow-up: {ofu})" if ofu else "")
         html += f"""
 <tr>
-  <td style="text-align:left;">{design_cell}</td>
-  <td>{_fmt_factor(g.risk_of_bias)}</td>
-  <td>{_fmt_factor(g.inconsistency)}</td>
-  <td>{_fmt_factor(g.indirectness)}</td>
-  <td>{_fmt_factor(g.imprecision)}</td>
-  <td>{_fmt_factor(g.publication_bias)}</td>
-  <td>{ev_int if ev_int else 'NR'}</td>
-  <td>{ev_comp if ev_comp else 'NR'}</td>
-  <td style="text-align:center;">{g.relative_effect}</td>
-  <td style="text-align:center;">{cert_display}</td>
+  <td colspan="11" class="outcome-header"
+      style="background:#2C3E50;color:white;font-weight:bold;
+             text-align:left;padding:7px 10px;">
+    {out_label}
+  </td>
 </tr>
 """
 
+        for design_key, design_label in [("rct","RCTs"),
+                                          ("observational","Observational")]:
+            g = dmap.get(design_key)
+            if not g:
+                continue
+
+            sym   = CERT_SYMBOLS.get(g.final_certainty, "")
+            color = CERT_COLORS.get(g.final_certainty, "#000")
+            cert_cell = (
+                f'<span style="color:{color};font-size:1.1em;">{sym}</span><br>'
+                f'<span style="color:{color};font-weight:bold;">'
+                f'{g.final_certainty.replace("_"," ").upper()}</span>'
+            )
+
+            ev_int  = manual_events.get(f"{oname}_{design_key}_int",  "") or "NR"
+            ev_comp = manual_events.get(f"{oname}_{design_key}_comp", "") or "NR"
+
+            design_cell = (
+                f"<b>{'RCTs' if design_key=='rct' else 'Observational'}</b><br>"
+                f"{g.n_studies} study" if g.n_studies==1
+                else
+                f"<b>{'RCTs' if design_key=='rct' else 'Observational'}</b><br>"
+                f"{g.n_studies} studies, n={g.n_participants or 'NR'}"
+            )
+
+            html += f"""
+<tr>
+  <td style="text-align:left;color:#555;font-size:0.9em;">
+    {'Critical' if out.get('importance')=='Critical' else out.get('importance','')}</td>
+  <td style="text-align:left;">{design_cell}</td>
+  <td>{_fmt(g.risk_of_bias)}</td>
+  <td>{_fmt(g.inconsistency)}</td>
+  <td>{_fmt(g.indirectness)}</td>
+  <td>{_fmt(g.imprecision)}</td>
+  <td>{_fmt(g.publication_bias)}</td>
+  <td>{ev_int}</td>
+  <td>{ev_comp}</td>
+  <td style="text-align:center;">{g.relative_effect}</td>
+  <td style="text-align:center;">{cert_cell}</td>
+</tr>
+"""
+            # Collect footnotes
+            for f in g.all_factors:
+                if f.direction != "none" and f.rationale:
+                    footnotes.append(
+                        f"<b>{oname} — {'RCTs' if design_key=='rct' else 'Obs'} "
+                        f"— {f.name}:</b> {f.rationale}")
+
     html += "</tbody></table>"
 
-    # Footnotes
-    footnotes = []
-    for design_key, design_label in [("rct","RCTs"),("observational","Observational")]:
-        g = grade_results.get(design_key)
-        if not g: continue
-        for f in g.all_factors:
-            if f.direction != "none" and f.rationale:
-                footnotes.append(f"<b>{design_label} — {f.name}:</b> {f.rationale}")
-
     if footnotes:
-        html += "<br><small><b>Explanations:</b><br>" + \
-                "<br>".join(f"• {fn}" for fn in footnotes) + "</small>"
+        html += ("<br><small><b>Explanations:</b><br>"
+                 + "<br>".join(f"• {fn}" for fn in footnotes)
+                 + "</small>")
 
     return html
 
@@ -11823,221 +11962,12 @@ def _get_pub_types(article: dict) -> Optional[List[str]]:
 def _get_full_text(article: dict) -> str:
     """Get full text if available (stored in session_state by full-text pipeline)."""
     return ""   # Full text integration deferred — abstract is primary input
+
+
 ===== .\ui\prisma_panel.py =====
 
 # ui/prisma_panel.py v1 - 25th March
-#
-# Redesigned PRISMA diagram panel.
-#
-# Key improvements over previous version:
-#   1. Dual output modes: Black & White (publication-standard) and Colour (customisable)
-#   2. Dynamic database sources: "Records identified" box updates with db name and N
-#   3. Scalable architecture: add more databases without refactoring the diagram logic
-#   4. Fixed rendering bugs: consistent box sizing, proper arrow anchoring
-#   5. Publication-quality export: high-DPI PNG and vector SVG
-#   6. Clean PRISMA 2020 structure matching the attached journal example
 
-# ui/prisma_panel.py v2 - 27th March
-# ui/prisma_panel.py
-#
-# ── FIX 4: PRISMA B&W TOGGLE LOOP + CUSTOMISATION NOT APPLYING ───────────────
-#
-# Root cause of the infinite rerun loop:
-#   The mode radio widget was inside the diagram sub-tab. When the user clicked
-#   "Black & White", the code detected new_mode != current_mode, called
-#   settings_repo.save_settings() and then st.rerun(). On the rerun, Streamlit
-#   re-read the DB value (which was now "bw") and re-rendered the radio as "bw"
-#   — but the widget value also read "bw" now, so new_mode == current_mode and
-#   no further rerun was triggered. That should have worked... EXCEPT that
-#   Streamlit's st.radio with an explicit `index` parameter ignores the widget's
-#   stored value on the FIRST render of a new widget key. The result was the
-#   toggle appeared stuck and the page kept refreshing.
-#
-# Fix:
-#   Mode is stored in st.session_state immediately when the radio changes.
-#   The figure is built from session_state mode, NOT from the DB settings mode.
-#   No st.rerun() is called from the mode toggle. DB is only written when the
-#   user explicitly clicks "Apply Changes". This separates the "preview" state
-#   from the "persisted" state and eliminates the rerun loop entirely.
-#
-# Additional fixes:
-#   - Dynamic database label: auto-populated from st.session_state["prisma_db_{review_id}"]
-#     which is written by app.py after every PubMed/PMC search.
-#   - Customisation changes apply IMMEDIATELY to the live diagram preview because
-#     the figure is rebuilt from the UI widget values before the DB write.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ui/prisma_panel.py v3 - 27th March
-# New features:
-#   - Arrow length (vertical gap between boxes) slider
-#   - Arrow width slider
-#   - Horizontal gap (main col ↔ side col) slider
-#   - Vertical spacing between all boxes is now fully parameterised
-#   - Custom extra box: user can add one free-form box anywhere on the canvas
-#   - Font family selector for box text AND side labels
-#   - Side label (Identification/Screening/Eligibility/Included) font size slider
-#   - All new settings persisted in the same JSON blob alongside existing ones
-
-# FIXES IN THIS VERSION:
-#
-# FIX A — "Database Sources" expander resets all other customisation to defaults
-#   Root cause: The expander was set to `expanded=True`. In Streamlit, when an
-#   expander is open by default, any widget inside it is rendered on the first
-#   render cycle. But ALL other expanders (colours, layout, typography, etc.)
-#   are closed, so their widgets are NOT rendered — meaning new_bc, new_fc,
-#   new_bw_, etc. are undefined when preview_settings is assembled.
-#   Fix: All expanders start `expanded=False`. The db section is kept open by
-#   detecting whether databases is empty (first-time setup). Widget default
-#   values always fall back to `settings` dict, so unopened expanders never
-#   cause KeyErrors.
-#
-# FIX B — Arrows not touching box edges
-#   Root cause: Arrow endpoints used a fixed ±0.005 gap regardless of bh.
-#   When bh was large the arrow stopped well short of the box.
-#   Fix: Arrow starts/ends exactly at box edge (y ± bh/2) with zero gap.
-#   Plotly renders the arrowhead ON the endpoint coordinate, so setting
-#   the endpoint to exactly the box edge looks correct visually.
-#
-# FIX C — Label X position stays fixed when main column moves
-#   Root cause: Stage labels were hardcoded at x=0.03. When box width was
-#   reduced the gap between label and box grew because main_x was also
-#   reduced visually but the label stayed at 0.03.
-#   Fix: Label x = main_x - bw/2 - label_margin, where label_margin is a
-#   user-controlled slider "Label distance from diagram".
-#
-# FIX D — Extra custom box inherits diagram defaults
-#   The extra box now uses the same bw/bh/fs/ff as the diagram unless
-#   the user explicitly overrides them (via scale factors and the override
-#   toggle). This means changing global font size also changes the extra box.
-#
-# FIX E — Extra box arrow connection
-#   User can choose which standard box to connect the extra box to (or none),
-#   pick direction (from/to), and the arrow is drawn automatically.
-#
-# FIX F — "Add Database" button no longer resets other settings
-#   Instead of calling save_settings (which triggers a rerun with only the
-#   partial settings object), the new entry is added to the in-memory list
-#   and the full preview_settings is saved atomically on "Apply Changes".
-#   The button itself now just appends to a session_state list so the new
-#   row appears immediately without losing other widget values.
- 
-
-
-# ui/prisma_panel.py — v6 1st April, 2026
-#
-
-# ═══════════════════════════════════════════════════════════════════
-# COMPLETE REWRITE OF THE FIGURE BUILDER
-# ═══════════════════════════════════════════════════════════════════
-#
-# ROOT CAUSE OF ARROW MISALIGNMENT (definitive fix):
-#
-# All previous versions used Plotly "annotation" objects with
-# axref/ayref="x", yref/xref="x" to draw arrows. This approach has
-# a fundamental flaw: the "tail" (ax, ay) uses DATA coordinates, but
-# data coordinates are mapped to pixel coordinates by Plotly's internal
-# axis scaling, which depends on the figure size, margins, and the
-# visible range. Small rounding differences cause the arrow tail to
-# stop 5–15 pixels short of the box edge.
-#
-# THE FIX: Switch the entire figure to PAPER coordinates (0.0–1.0,
-# normalised to the figure dimensions). In paper coordinates:
-#   - Boxes are drawn as go.layout.Shape with xref="paper", yref="paper"
-#   - Text is added with go.layout.Annotation with xref="paper", yref="paper"
-#   - Arrows are drawn as go.layout.Shape type="path" using SVG path strings
-#     e.g. "M x1 y1 L x2 y2" in paper coordinates
-# Because everything uses the same paper coordinate system, there is no
-# coordinate-system mismatch and arrows touch boxes exactly.
-#
-# PRISMA 2020 LAYOUT (from images 1–5 provided by user):
-#   Stage labels: vertical text on left (blue bars)
-#   Single source: Identification → [Duplicates right] → Screening → [Excluded right]
-#                  → Eligibility → [Full-text excl. right] → Included
-#   Multi source:  [DB1 box] [DB2 box] → merge → [Dedup box right] → Screening → ...
-#   All side boxes connected by horizontal arrows FROM main column
-#   All stage boxes connected by vertical arrows between rows
-#
-# ═══════════════════════════════════════════════════════════════════
-
-
-
-# ui/prisma_panel.py — v5
-#
-# ═══════════════════════════════════════════════════════════════════
-# COMPLETE REWRITE OF THE FIGURE BUILDER
-# ═══════════════════════════════════════════════════════════════════
-#
-# ROOT CAUSE OF ARROW MISALIGNMENT (definitive fix):
-#
-# All previous versions used Plotly "annotation" objects with
-# axref/ayref="x", yref/xref="x" to draw arrows. This approach has
-# a fundamental flaw: the "tail" (ax, ay) uses DATA coordinates, but
-# data coordinates are mapped to pixel coordinates by Plotly's internal
-# axis scaling, which depends on the figure size, margins, and the
-# visible range. Small rounding differences cause the arrow tail to
-# stop 5–15 pixels short of the box edge.
-#
-# THE FIX: Switch the entire figure to PAPER coordinates (0.0–1.0,
-# normalised to the figure dimensions). In paper coordinates:
-#   - Boxes are drawn as go.layout.Shape with xref="paper", yref="paper"
-#   - Text is added with go.layout.Annotation with xref="paper", yref="paper"
-#   - Arrows are drawn as go.layout.Shape type="path" using SVG path strings
-#     e.g. "M x1 y1 L x2 y2" in paper coordinates
-# Because everything uses the same paper coordinate system, there is no
-# coordinate-system mismatch and arrows touch boxes exactly.
-#
-# PRISMA 2020 LAYOUT (from images 1–5 provided by user):
-#   Stage labels: vertical text on left (blue bars)
-#   Single source: Identification → [Duplicates right] → Screening → [Excluded right]
-#                  → Eligibility → [Full-text excl. right] → Included
-#   Multi source:  [DB1 box] [DB2 box] → merge → [Dedup box right] → Screening → ...
-#   All side boxes connected by horizontal arrows FROM main column
-#   All stage boxes connected by vertical arrows between rows
-#
-# ═══════════════════════════════════════════════════════════════════
-
-
-
-
-
-
-
-
-
-# ui/prisma_panel.py — v5
-#
-# ═══════════════════════════════════════════════════════════════════
-# COMPLETE REWRITE OF THE FIGURE BUILDER
-# ═══════════════════════════════════════════════════════════════════
-#
-# ROOT CAUSE OF ARROW MISALIGNMENT (definitive fix):
-#
-# All previous versions used Plotly "annotation" objects with
-# axref/ayref="x", yref/xref="x" to draw arrows. This approach has
-# a fundamental flaw: the "tail" (ax, ay) uses DATA coordinates, but
-# data coordinates are mapped to pixel coordinates by Plotly's internal
-# axis scaling, which depends on the figure size, margins, and the
-# visible range. Small rounding differences cause the arrow tail to
-# stop 5–15 pixels short of the box edge.
-#
-# THE FIX: Switch the entire figure to PAPER coordinates (0.0–1.0,
-# normalised to the figure dimensions). In paper coordinates:
-#   - Boxes are drawn as go.layout.Shape with xref="paper", yref="paper"
-#   - Text is added with go.layout.Annotation with xref="paper", yref="paper"
-#   - Arrows are drawn as go.layout.Shape type="path" using SVG path strings
-#     e.g. "M x1 y1 L x2 y2" in paper coordinates
-# Because everything uses the same paper coordinate system, there is no
-# coordinate-system mismatch and arrows touch boxes exactly.
-#
-# PRISMA 2020 LAYOUT (from images 1–5 provided by user):
-#   Stage labels: vertical text on left (blue bars)
-#   Single source: Identification → [Duplicates right] → Screening → [Excluded right]
-#                  → Eligibility → [Full-text excl. right] → Included
-#   Multi source:  [DB1 box] [DB2 box] → merge → [Dedup box right] → Screening → ...
-#   All side boxes connected by horizontal arrows FROM main column
-#   All stage boxes connected by vertical arrows between rows
-#
-# ═══════════════════════════════════════════════════════════════════
 
 import json
 import logging
@@ -13230,1164 +13160,6 @@ def _render_export_panel(review_id, settings, counts):
                 st.error(f"Import failed: {e}")
     with st.expander("Current settings (JSON)", expanded=False):
         st.json(settings)
-
-
-===== .\ui\QA_OLD_ai_analysis_panel.py =====
-
-# ui/ai_analysis_panel.py v1 -  25th March, 2026
-#
-# AI Analysis panel — Tab 2 in the updated workflow.
-#
-# Workflow dependency (enforced here):
-#   Screening must run first. Only articles with an "include" consensus
-#   decision are passed into AI Analysis. This mirrors real-world SR
-#   practice where AI-assisted analysis is performed only on eligible studies.
-#
-# Tabs within this panel:
-#   1. Summarization    — structured 5-point summaries
-#   2. PICO Extraction  — population, intervention, comparison, outcome
-#   3. Quality Assessment — methodological quality (replaces binary scorer)
-#   4. Data Pooling     — composite table for meta-analysis preparation
-#
-# Architecture:
-#   - Each sub-tab operates independently so users can run only what they need.
-#   - Results are cached in session_state per (review_id, pmid) to avoid
-#     redundant LLM calls on re-renders.
-#   - The Data Pooling tab aggregates across all included articles and
-#     provides a one-click CSV export.
-
-# ui/ai_analysis_panel.py v2 -  27th March
-# #
-# ── FIX 3: AI ANALYSIS CORRECT COUNTS + QUALITY SCORING ─────────────────────
-#
-# Problems fixed:
-#
-# (a) Wrong "pending" count
-#     Old: counted articles with NO consensus (including genuine conflicts)
-#     New: "pending" = articles where ZERO reviewers have voted at all.
-#          Articles with a conflict (2+ reviewers, disagreement) are shown as
-#          "conflict", not "pending". This matches what the dashboard shows.
-#
-# (b) Old conflict count shown after Editor resolution
-#     Old: _get_consensus_decision() only checked a hard-coded list of special
-#          keys ("final_resolved", "editor", "adjudicator"). But the actual key
-#          stored by AdjudicationRepository.save_adjudication() is the Editor's
-#          reviewer_id, e.g. "rev_editor". The check was missing this.
-#     New: Check the adjudications table FIRST via adjudication_repo directly,
-#          which is the authoritative source after resolution.
-#
-# (c) Quality scores all 0 / "Parse error"
-#     Old: The QUALITY_ASSESSMENT_PROMPT ended with `{{` which the LLM
-#          saw literally and produced malformed partial JSON. The prompt
-#          is fixed in config/prompts.py (remove the trailing `{{`).
-#     The parser here is also made more robust: it strips preamble text and
-#     handles truncated outputs gracefully.
-#
-# (d) AI Analysis should use ALL included articles (from PubMed abstract
-#     screening), not just PMC-subset articles.
-#     This was already correct in the data flow (article_repo.get_articles_for_review
-#     returns ALL articles for the review regardless of source), but the
-#     consensus logic bug (b) above caused many articles to appear as
-#     "unresolved conflict" even after the Editor had resolved them.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ui/ai_analysis_panel.py v3 -  27th March
-#
-# Fix for PICO / Quality / Data Pooling showing empty tables:
-#   Root cause: The "Run All" button caused Streamlit to rerun immediately.
-#   On that rerun, each expander checked `if run_all or run_one or cached`.
-#   run_all was True, cached was None (LLM hadn't run yet), so the code
-#   entered the display block, found no result, and appended nothing to
-#   rows_for_table — yet the table still rendered (empty).
-#   The LLM calls inside the spinners DID run, but because st.button state
-#   only persists for ONE render cycle, on the NEXT rerun run_all was False
-#   again, so the display loop only showed cached results — which were correctly
-#   populated by then. However, the summary table was built from the FIRST
-#   (empty) pass, not the post-LLM pass.
-#
-#   Fix: move ALL table-building to a separate pass that only reads from
-#   session_state cache AFTER the per-article processing loop. This way:
-#   - First pass: LLM runs, results stored in session_state
-#   - Subsequent renders: results read from cache and displayed correctly
-#   - Table is ALWAYS built only from articles that have cached results
-
-
-# ui/ai_analysis_panel.py  — v4   31st March
-#
-# ROOT CAUSE OF "tabs still not working":
-#
-# The previous fix (separate loop for table) was correct in logic but missed
-# one critical detail: after the LLM runs inside a st.spinner(), the result
-# is stored in session_state — but the TABLE-BUILDING pass that reads
-# session_state runs in the SAME render cycle, immediately after the loop.
-# At that point the cache IS populated, so the table SHOULD appear.
-#
-# The actual remaining bug is different: the "run_all" button's True state
-# only lasts for ONE render cycle (standard Streamlit behaviour).  When a user
-# clicks "Run All", Streamlit reruns the script with run_all=True.
-# The loop runs, LLM is called, results go into session_state.
-# Then the table-building pass reads session_state and builds the table.
-# This SHOULD work.  But if the LLM call raises ANY exception (even a soft
-# warning), or if the model returns empty output, _set_cached() stores None
-# or an empty object — and the table row is skipped.
-#
-# More importantly: the quality_assessor and data_pooler were calling
-# run_inference() which calls the local LLM.  If the local model is NOT loaded
-# (common in development / first run), run_inference() may return an empty
-# string or raise, and _parse_quality() / _parse_study_data() return a
-# default object with all-zero scores.  The session_state then holds a
-# "bad" cached object, and subsequent rerenders show 0s.
-#
-# Additional bug: the cache check `if (run_all or run_one) and not cached`
-# means that if a bad result (0-score QA) is cached from a failed LLM call,
-# clicking "Run All" again does NOTHING because `cached` is truthy (it's a
-# QualityAssessment object, even if all-zero).
-#
-# FIX: 
-# 1. Add a "Force re-run (clear cache)" button per-tab so users can retry.
-# 2. Show the raw LLM output in an expander for debugging when quality=unknown.
-# 3. The quality assessor and data pooler now log and surface errors clearly.
-# 4. run_all loop now calls st.rerun() at the end so the table appears
-#    on the very next render (not relying on same-cycle table pass).
-
-
-
-
-# ui/ai_analysis_panel.py
-#
-# CHANGES in this version:
-#
-# 1. DOI LINK IN EVERY ARTICLE EXPANDER
-#    Every included article expander now shows a clickable DOI link so the
-#    reviewer can always go back to the original paper while reviewing AI output.
-#    Also shows PubMed link for PubMed-sourced articles.
-#
-# 2. AI DISCLAIMER BANNER
-#    Each analysis tab shows a persistent ⚠️ disclaimer reminding users
-#    not to rely on AI output blindly. This is a standard requirement for
-#    responsible AI in clinical research tools and satisfies PRISMA/EQUATOR
-#    reporting expectations for AI-assisted reviews.
-#
-# 3. ARCHITECTURE NOTES (for future scaling)
-#    - All analysis functions (_tab_summarization etc.) receive the full
-#      article dict, not just abstract, so future extensions (e.g. full-text
-#      analysis, citation networks) can access all fields.
-#    - Cache keys use (review_id, pmid, task) so adding new tasks only
-#      requires adding a new _tab_* function and cache key suffix.
-#    - The AI disclaimer is a single helper function _render_ai_disclaimer()
-#      so it can be updated globally from one place.
-
-
-# ui/ai_analysis_panel.py — v2 13th April 2026
-#
-# CHANGES:
-#   Added two new tabs:
-#     ⚖️  Risk of Bias — RoB 2 (RCTs) / NOS (observational) per-article assessment
-#     📋  GRADE / SoF   — GRADE certainty across all included studies + SoF table
-#   Original four tabs unchanged.
-#
-# Architecture:
-#   - study_classifier determines which RoB tool to apply per article
-#   - rob2_assessor / nos_assessor run LLM signalling questions + deterministic algorithm
-#   - grade_assessor aggregates across all studies for the overall evidence certainty
-#   - All results cached in session_state (same pattern as existing tabs)
- 
-
-
-import json
-import logging
-from typing import Dict, List, Optional
-
-import pandas as pd
-import streamlit as st
-
-from pipeline.summarizer       import summarize_with_llm
-from pipeline.pico_extractor   import extract_pico
-from pipeline.quality_assessor import assess_quality
-from pipeline.data_pooler      import extract_study_data, build_composite_table, StudyData
-from pipeline.study_classifier   import classify_study, StudyDesign
-from pipeline.rob2_assessor      import assess_rob2, RISK_EMOJI, RISK_LABEL
-from pipeline.nos_assessor       import assess_nos
-from pipeline.grade_assessor     import assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI
-from storage.repository import (
-    ArticleRepository, ScreeningRepository, AdjudicationRepository
-)
-
-logger = logging.getLogger(__name__)
-
-article_repo      = ArticleRepository()
-screening_repo    = ScreeningRepository()
-adjudication_repo = AdjudicationRepository()
-
-SYSTEM_REVIEWER_IDS = {"final_resolved", "editor", "adjudicator"}
-
-
-# ── AI Disclaimer ──────────────────────────────────────────────────────────────
-
-def _render_ai_disclaimer() -> None:
-    """
-    Persistent disclaimer shown at the top of every AI analysis tab.
-    Required for responsible AI use in clinical/research tools.
-    Scalable: update this single function to change the disclaimer globally.
-    """
-    st.warning(
-        "⚠️ **AI Output — Human Verification Required**\n\n"
-        "Results are generated by a Large Language Model and may contain errors. "
-        "**Do not use AI output as a substitute for reading the original papers.** "
-        "Always verify key findings against the original publication. "
-        "Use the **DOI / PubMed links** in each article panel to access the source."
-    )
-
-
-# ── Cache helpers ──────────────────────────────────────────────────────────────
-
-def _ck(review_id, pmid, task):
-    return f"ai_{review_id}_{pmid}_{task}"
-
-def _get_cached(review_id, pmid, task):
-    return st.session_state.get(_ck(review_id, pmid, task))
-
-def _set_cached(review_id, pmid, task, value):
-    st.session_state[_ck(review_id, pmid, task)] = value
-
-def _clear_task_cache(review_id, articles, task):
-    """Remove cached results for a task so LLM re-runs on next trigger."""
-    for a in articles:
-        key = _ck(review_id, a["pmid"], task)
-        if key in st.session_state:
-            del st.session_state[key]
-    if task == "quality":
-        for a in articles:
-            k2 = _ck(review_id, a["pmid"], "quality_label")
-            if k2 in st.session_state:
-                del st.session_state[k2]
-
-
-# ── DOI / source link helper ───────────────────────────────────────────────────
-
-def _article_links_md(article: dict) -> str:
-    """
-    Return a markdown string of links for an article.
-    Shown in every AI analysis expander so users can verify AI output
-    against the original paper at any time.
-    """
-    links = []
-    doi = article.get("doi") or ""
-    if doi:
-        doi_clean = doi.strip()
-        for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
-            if doi_clean.lower().startswith(prefix.lower()):
-                doi_clean = doi_clean[len(prefix):]
-                break
-        links.append(f"[🌐 DOI](https://doi.org/{doi_clean.strip()})")
-
-    source = str(article.get("source") or "")
-    pmid   = article.get("pmid") or ""
-    if source == "pubmed" and pmid and not pmid.startswith("EPMC:"):
-        links.append(f"[🔗 PubMed](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)")
-
-    url = article.get("url") or ""
-    if "europepmc" in url:
-        links.append(f"[🟢 Europe PMC]({url})")
-
-    return "  ·  ".join(links) if links else ""
-
-
-# ── Consensus logic ────────────────────────────────────────────────────────────
-
-def _get_consensus_decision(review_id, pmid):
-    adj = adjudication_repo.get_adjudication(review_id, pmid)
-    if adj and adj.get("final_decision"):
-        return adj["final_decision"]
-    all_decs = screening_repo.get_all_decisions_for_article(
-        review_id, pmid, "title_abstract"
-    )
-    primary = {k: v for k, v in all_decs.items() if k not in SYSTEM_REVIEWER_IDS}
-    if not primary:
-        return None
-    unique = set(primary.values())
-    return unique.pop() if len(unique) == 1 else None
-
-def _get_included_articles(review_id, all_articles):
-    return [a for a in all_articles
-            if _get_consensus_decision(review_id, a["pmid"]) == "include"]
-
-def _count_pending(review_id, all_articles):
-    count = 0
-    for a in all_articles:
-        all_decs = screening_repo.get_all_decisions_for_article(
-            review_id, a["pmid"], "title_abstract"
-        )
-        primary = {k: v for k, v in all_decs.items() if k not in SYSTEM_REVIEWER_IDS}
-        if len(primary) == 0:
-            count += 1
-    return count
-
-
-# ── Main entry point ───────────────────────────────────────────────────────────
-
-def render_ai_analysis_panel(review_id: int) -> None:
-    all_articles = article_repo.get_articles_for_review(review_id)
-    if not all_articles:
-        st.info("📋 No articles found. Run a search first (Search tab).")
-        return
-
-    included  = _get_included_articles(review_id, all_articles)
-    n_total   = len(all_articles)
-    n_incl    = len(included)
-    n_pending = _count_pending(review_id, all_articles)
-    db_counts = article_repo.get_screening_counts(review_id)
-    n_conflict= db_counts.get("conflict", 0)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Articles", n_total)
-    c2.metric("✅ Included",    n_incl)
-    c3.metric("⏳ Pending",     n_pending)
-    c4.metric("⚠️ Conflicts",   n_conflict)
-
-    if n_pending > 0:
-        st.warning(f"⚠️ **{n_pending}** article(s) not yet screened. "
-                   "Complete screening first.")
-    if n_conflict > 0:
-        st.warning(f"⚠️ **{n_conflict}** conflict(s) unresolved. "
-                   "Switch to **Editor** → Screening → Conflicts to resolve.")
-
-    if n_incl == 0:
-        st.info("No articles included yet. Go to **Screening** and mark articles as Include.")
-        return
-
-    st.success(f"✅ **{n_incl}** article(s) included — AI analysis ready.")
-    st.caption("AI Analysis uses the full PubMed abstract dataset.")
-    st.divider()
-
-    (tab_sum, tab_pico, tab_qual, tab_pool,
-     tab_rob, tab_grade) = st.tabs([
-        "📝 Summarization",
-        "🔬 PICO Extraction",
-        "⭐ Quality Assessment",
-        "📊 Data Pooling",
-        "⚖️ Risk of Bias",
-        "📋 GRADE / SoF",
-    ])
-
-    with tab_sum:
-        _tab_summarization(review_id, included)
-    with tab_pico:
-        _tab_pico(review_id, included)
-    with tab_qual:
-        _tab_quality(review_id, included)
-    with tab_pool:
-        _tab_data_pool(review_id, included)
-    with tab_rob:
-        _tab_risk_of_bias(review_id, included)
-    with tab_grade:
-        _tab_grade(review_id, included)
-
-
-# ── Summarization ──────────────────────────────────────────────────────────────
-
-def _tab_summarization(review_id, articles):
-    st.markdown("### 📝 Structured Summaries")
-    st.caption("5 bullet points: Study Design · Population · Intervention · Key Findings · Conclusion.")
-
-    # AI disclaimer
-    _render_ai_disclaimer()
-
-    c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Summarise All", key="sum_all", type="primary")
-    if c2.button("🔄 Clear All Summaries", key="sum_clear"):
-        _clear_task_cache(review_id, articles, "summary")
-        st.rerun()
-
-    ran_any = False
-    for article in articles:
-        pmid     = article["pmid"]
-        abstract = article.get("abstract", "")
-        cached   = _get_cached(review_id, pmid, "summary")
-        links_md = _article_links_md(article)
-
-        with st.expander(f"**{article['title'][:90]}**", expanded=False):
-            # DOI and source links always visible
-            meta_line = f"PMID: `{pmid}` · {article.get('journal','')}{article.get('year','')}"
-            if links_md:
-                st.caption(f"{meta_line}  |  {links_md}")
-            else:
-                st.caption(meta_line)
-
-            if not abstract:
-                st.warning("No abstract available.")
-            run_one = st.button("Summarise", key=f"sum_{pmid}")
-
-            if (run_all or run_one) and not cached:
-                with st.spinner("Summarising…"):
-                    try:
-                        result = summarize_with_llm(abstract)
-                        _set_cached(review_id, pmid, "summary", result or "(no output)")
-                        ran_any = True
-                    except Exception as e:
-                        _set_cached(review_id, pmid, "summary", f"Error: {e}")
-
-            result = _get_cached(review_id, pmid, "summary")
-            if result:
-                st.markdown("**Summary:**")
-                st.markdown(result)
-
-    if run_all and ran_any:
-        st.rerun()
-
-
-# ── PICO Extraction ────────────────────────────────────────────────────────────
-
-def _tab_pico(review_id, articles):
-    st.markdown("### 🔬 PICO Extraction")
-    st.caption("Population · Intervention · Comparison · Outcome · Study Design · Sample Size")
-
-    _render_ai_disclaimer()
-
-    c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Extract PICO for All", key="pico_all", type="primary")
-    if c2.button("🔄 Clear All PICO", key="pico_clear"):
-        _clear_task_cache(review_id, articles, "pico")
-        st.rerun()
-
-    ran_any = False
-    for article in articles:
-        pmid     = article["pmid"]
-        abstract = article.get("abstract", "")
-        cached   = _get_cached(review_id, pmid, "pico")
-        links_md = _article_links_md(article)
-
-        with st.expander(f"**{article['title'][:90]}**", expanded=False):
-            meta_line = f"PMID: `{pmid}`"
-            if links_md:
-                st.caption(f"{meta_line}  |  {links_md}")
-            else:
-                st.caption(meta_line)
-
-            run_one = st.button("Extract PICO", key=f"pico_{pmid}")
-            if (run_all or run_one) and not cached:
-                with st.spinner("Extracting PICO…"):
-                    try:
-                        result = extract_pico(abstract)
-                        _set_cached(review_id, pmid, "pico", result)
-                        ran_any = True
-                    except Exception as e:
-                        logger.error("PICO extraction error PMID %s: %s", pmid, e)
-
-            pico = _get_cached(review_id, pmid, "pico")
-            if pico:
-                c1_, c2_ = st.columns(2)
-                c1_.markdown(f"**Population:** {pico.population or '—'}")
-                c1_.markdown(f"**Intervention:** {pico.intervention or '—'}")
-                c2_.markdown(f"**Comparison:** {pico.comparison or '—'}")
-                c2_.markdown(f"**Outcome:** {pico.outcome or '—'}")
-
-    # Table from cache
-    rows = []
-    for a in articles:
-        p = _get_cached(review_id, a["pmid"], "pico")
-        if p:
-            doi = a.get("doi") or ""
-            rows.append({
-                "PMID":         a["pmid"],
-                "Title":        a["title"][:60],
-                "DOI":          doi,
-                "Population":   p.population or "—",
-                "Intervention": p.intervention or "—",
-                "Comparison":   p.comparison or "—",
-                "Outcome":      p.outcome or "—",
-            })
-    if rows:
-        st.divider()
-        st.markdown(f"#### PICO Table ({len(rows)}/{len(articles)} articles)")
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("📥 Export PICO (CSV)", data=df.to_csv(index=False),
-                           file_name="pico_extraction.csv", mime="text/csv")
-
-    if run_all and ran_any:
-        st.rerun()
-
-
-# ── Quality Assessment (existing custom rubric — kept for continuity)───────────────────────────────────────
-
-def _tab_quality(review_id, articles):
-    st.markdown("### ⭐ Methodological Quality Assessment")
-    st.caption("5 domains × 1–3 points each (max 15). High ≥12 · Moderate 8–11 · Low <8. For standardised assessment use the ⚖️ Risk of Bias tab.")
-
-    _render_ai_disclaimer()
-
-    with st.expander("ℹ️ Domain definitions", expanded=False):
-        st.markdown("""
-| Domain | 1 (Low) | 2 (Moderate) | 3 (High) |
-|---|---|---|---|
-| Randomisation | No control | Controlled | RCT |
-| Sample Size | <30 | 30–100 | >100 |
-| Outcome Reporting | Subjective only | Mixed | Objective + stats |
-| Follow-up | Not reported | <3 months | ≥3 months, complete |
-| Comparator | None | Historical | Concurrent |
-
-**Troubleshooting 0/Unknown scores:** This means the LLM either is not
-loaded or returned output the parser could not interpret as JSON.
-Steps: (1) Check your model is loaded. (2) Click **Clear & Retry** to
-re-run. (3) Try a single article first using the individual "Assess" button.
-""")
-
-    c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Assess Quality for All", key="qual_all", type="primary")
-    if c2.button("🔄 Clear & Retry", key="qual_clear"):
-        _clear_task_cache(review_id, articles, "quality")
-        st.rerun()
-
-    ICON = {"high": "🟢", "moderate": "🟡", "low": "🔴", "unknown": "⬜"}
-    ran_any = False
-
-    for article in articles:
-        pmid     = article["pmid"]
-        abstract = article.get("abstract", "")
-        cached   = _get_cached(review_id, pmid, "quality")
-        ql       = _get_cached(review_id, pmid, "quality_label") or "unknown"
-        links_md = _article_links_md(article)
-
-        with st.expander(
-            f"{ICON.get(ql,'⬜')} **{article['title'][:80]}**",
-            expanded=False
-        ):
-            meta_line = f"PMID: `{pmid}`"
-            if links_md:
-                st.caption(f"{meta_line}  |  {links_md}")
-            else:
-                st.caption(meta_line)
-
-            run_one = st.button("Assess Quality", key=f"qual_{pmid}")
-            if (run_all or run_one) and not cached:
-                with st.spinner("Assessing…"):
-                    try:
-                        qa = assess_quality(abstract)
-                        _set_cached(review_id, pmid, "quality", qa)
-                        _set_cached(review_id, pmid, "quality_label", qa.overall_quality)
-                        ran_any = True
-                    except Exception as e:
-                        logger.error("Quality error PMID %s: %s", pmid, e)
-                        st.error(f"Quality assessment error: {e}")
-
-            qa = _get_cached(review_id, pmid, "quality")
-            if qa:
-                icon = ICON.get(qa.overall_quality, "⬜")
-                st.markdown(
-                    f"**Overall:** {icon} **{qa.overall_quality.capitalize()}** "
-                    f"— {qa.total_score}/15"
-                )
-                if qa.total_score == 0 and qa.overall_quality == "unknown":
-                    st.error(
-                        "Score is 0/Unknown — LLM output could not be parsed. "
-                        "Check that your model is loaded, then click 🔄 Clear & Retry."
-                    )
-                c1_, c2_, c3_, c4_, c5_ = st.columns(5)
-                c1_.metric("Randomisation", f"{qa.randomisation_score}/3")
-                c2_.metric("Sample Size",   f"{qa.sample_size_score}/3")
-                c3_.metric("Outcomes",      f"{qa.outcome_reporting_score}/3")
-                c4_.metric("Follow-up",     f"{qa.followup_score}/3")
-                c5_.metric("Comparator",    f"{qa.comparator_score}/3")
-                if qa.quality_notes:
-                    st.caption(f"📝 {qa.quality_notes}")
-
-    rows = []
-    for a in articles:
-        qa = _get_cached(review_id, a["pmid"], "quality")
-        if qa:
-            rows.append({
-                "PMID":          a["pmid"],
-                "Title":         a["title"][:55],
-                "DOI":           a.get("doi") or "",
-                "Score":         qa.total_score,
-                "Quality":       qa.overall_quality.capitalize(),
-                "Randomisation": qa.randomisation_score,
-                "Sample Size":   qa.sample_size_score,
-                "Outcomes":      qa.outcome_reporting_score,
-                "Follow-up":     qa.followup_score,
-                "Comparator":    qa.comparator_score,
-                "Notes":         qa.quality_notes or "",
-            })
-    if rows:
-        st.divider()
-        st.markdown(f"#### Quality Table ({len(rows)}/{len(articles)})")
-        df = pd.DataFrame(rows).sort_values("Score", ascending=False)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("📥 Export Quality (CSV)", data=df.to_csv(index=False),
-                           file_name="quality_assessment.csv", mime="text/csv")
-
-    if run_all and ran_any:
-        st.rerun()
-
-
-# ── Data Pooling ───────────────────────────────────────────────────────────────
-
-def _tab_data_pool(review_id, articles):
-    st.markdown("### 📊 Data Pooling for Meta-Analysis")
-    st.caption("Extracts structured data from each included study for MA preparation.")
-
-    _render_ai_disclaimer()
-
-    with st.expander("ℹ️ Fields extracted", expanded=False):
-        st.markdown(
-            "Sample size · Age group · Sex · Severity/baseline · "
-            "Intervention · Comparator · Follow-up · Primary outcome + result · "
-            "Secondary outcomes · Adverse events · Statistical significance · "
-            "Study design · Country/setting"
-        )
-
-    c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Extract Data from All", key="pool_all", type="primary")
-    if c2.button("🔄 Clear & Retry", key="pool_clear"):
-        _clear_task_cache(review_id, articles, "data_pool")
-        st.rerun()
-
-    missing_abstract = 0
-    ran_any          = False
-
-    for article in articles:
-        pmid     = article["pmid"]
-        abstract = article.get("abstract", "")
-        title    = article.get("title", "")
-        cached   = _get_cached(review_id, pmid, "data_pool")
-        links_md = _article_links_md(article)
-
-        if not abstract:
-            missing_abstract += 1
-
-        with st.expander(f"**{title[:80]}**", expanded=False):
-            meta_line = f"PMID: `{pmid}` · {article.get('journal','')}{article.get('year','')}"
-            if links_md:
-                st.caption(f"{meta_line}  |  {links_md}")
-            else:
-                st.caption(meta_line)
-
-            if not abstract:
-                st.warning("No abstract — extraction will produce minimal data.")
-            run_one = st.button("Extract Data", key=f"pool_{pmid}")
-
-            if (run_all or run_one) and not cached:
-                with st.spinner("Extracting structured data…"):
-                    try:
-                        sd = extract_study_data(abstract, pmid=pmid, title=title)
-                        _set_cached(review_id, pmid, "data_pool", sd)
-                        ran_any = True
-                    except Exception as e:
-                        logger.error("Data pool error PMID %s: %s", pmid, e)
-                        st.error(f"Extraction error: {e}")
-
-            sd = _get_cached(review_id, pmid, "data_pool")
-            if sd:
-                row  = sd.to_table_row()
-                keys = [k for k in row if k not in ("PMID", "Title")]
-                cols = st.columns(2)
-                for i, k in enumerate(keys):
-                    cols[i % 2].markdown(f"**{k}:** {row[k] or '—'}")
-
-    if missing_abstract > 0:
-        st.warning(f"⚠️ {missing_abstract} article(s) have no abstract. "
-                   "Run PMC Full-Text for richer extraction.")
-
-    # Composite table from cache
-    all_sd: List[StudyData] = []
-    for a in articles:
-        sd = _get_cached(review_id, a["pmid"], "data_pool")
-        if sd:
-            all_sd.append(sd)
-
-    if all_sd:
-        st.divider()
-        st.markdown(f"#### 📋 Composite Table ({len(all_sd)}/{len(articles)} studies)")
-        df = pd.DataFrame(build_composite_table(all_sd))
-
-        # Add DOI column to composite table for easy reference
-        doi_map = {a["pmid"]: (a.get("doi") or "") for a in articles}
-        if "PMID" in df.columns:
-            df.insert(2, "DOI", df["PMID"].map(lambda p: doi_map.get(p, "")))
-
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        c1_, c2_ = st.columns(2)
-        with c1_:
-            st.download_button("📥 CSV", data=df.to_csv(index=False),
-                               file_name=f"data_pooling_{review_id}.csv",
-                               mime="text/csv", use_container_width=True)
-        with c2_:
-            st.download_button("📥 JSON",
-                               data=json.dumps([sd.to_dict() for sd in all_sd], indent=2),
-                               file_name=f"data_pooling_{review_id}.json",
-                               mime="application/json", use_container_width=True)
-        st.divider()
-        _pool_summary(df)
-
-    if run_all and ran_any:
-        st.rerun()
-
-
-def _pool_summary(df):
-    st.markdown("#### Quick Summary")
-    c1, c2, c3 = st.columns(3)
-    if "Study Design" in df.columns:
-        designs = df["Study Design"].value_counts()
-        c1.markdown("**Study Designs:**")
-        for d, n in designs.items():
-            c1.markdown(f"- {d}: **{n}**")
-    if "Primary Result" in df.columns:
-        reported = (df["Primary Result"] != "Not reported").sum()
-        c2.metric("Outcomes Reported", f"{reported}/{len(df)}")
-    if "Comparator" in df.columns:
-        c2.metric("Comparator Available",
-                  (df["Comparator"] != "Not reported").sum())
-    if "Country/Setting" in df.columns:
-        countries = df["Country/Setting"].value_counts().head(5)
-        c3.markdown("**Top Countries:**")
-        for country, n in countries.items():
-            c3.markdown(f"- {country}: **{n}**")
-
-
-
-
-
-
-
-
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ⚖️  RISK OF BIAS TAB (NEW)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _tab_risk_of_bias(review_id, articles):
-    st.markdown("### ⚖️ Risk of Bias Assessment")
-    st.caption(
-        "**RCTs** → Cochrane RoB 2 (5 domains, Low / Some concerns / High risk)  |  "
-        "**Cohort/CC/XS** → Newcastle-Ottawa Scale (star system, max 9–10 stars)"
-    )
-    _render_ai_disclaimer()
-
-    with st.expander("ℹ️ How to interpret results", expanded=False):
-        st.markdown("""
-**RoB 2 (RCTs):** 5 domains, each rated 🟢 Low / 🟡 Some concerns / 🔴 High risk.
-Overall: 🔴 if any domain High, or ≥3 domains Some concerns; 🟡 if any Some concerns; 🟢 if all Low.
-
-**NOS (Observational):** Star awards per criterion. ⭐⭐⭐⭐⭐⭐⭐ = 7+ Good · 5-6 Fair · <5 Poor.
-Three versions: Cohort (max 9★) · Case-control (max 9★) · Cross-sectional NOS-xs2 (max 10★).
-
-**Why both tools?** RoB 2 and NOS assess different aspects of different study designs.
-Using the correct tool for each study is required by PRISMA 2020 and Cochrane guidelines.
-
-**Study classification** is automatic but you should verify it — the tool applied depends on it.
-""")
-
-    c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Assess All Articles", key="rob_all", type="primary")
-    if c2.button("🔄 Clear All RoB", key="rob_clear"):
-        for a in articles:
-            for t in ("study_class", "rob2", "nos"):
-                k = _ck(review_id, a["pmid"], t)
-                if k in st.session_state:
-                    del st.session_state[k]
-        st.rerun()
-
-    ran_any = False
-
-    for article in articles:
-        pmid     = article["pmid"]
-        abstract = article.get("abstract", "")
-        title    = article.get("title", "")
-        links_md = _article_links_md(article)
-
-        # ── Step 1: Classify study design ─────────────────────────────────────
-        clf = _get_cached(review_id, pmid, "study_class")
-        if (run_all or False) and not clf:
-            clf = classify_study(
-                abstract=abstract, title=title,
-                pub_types=_get_pub_types(article),
-            )
-            _set_cached(review_id, pmid, "study_class", clf)
-            ran_any = True
-        elif not clf:
-            clf = None
-
-        # Determine expander icon
-        rob_result = _get_cached(review_id, pmid, "rob2")
-        nos_result = _get_cached(review_id, pmid, "nos")
-        if rob_result:
-            icon = RISK_EMOJI.get(rob_result.overall, "⬜")
-        elif nos_result:
-            icon = nos_result.quality_emoji
-        elif clf:
-            icon = clf.emoji
-        else:
-            icon = "⬜"
-
-        with st.expander(f"{icon} **{title[:80]}**", expanded=False):
-            meta_line = f"PMID: `{pmid}` · {article.get('journal','')} {article.get('year','')}"
-            st.caption(f"{meta_line}  |  {links_md}" if links_md else meta_line)
-
-            # Run button (per-article)
-            run_one = st.button("Assess this article", key=f"rob_{pmid}")
-
-            if (run_all or run_one) and not clf:
-                clf = classify_study(
-                    abstract=abstract, title=title,
-                    pub_types=_get_pub_types(article),
-                )
-                _set_cached(review_id, pmid, "study_class", clf)
-                ran_any = True
-
-            if clf:
-                # Show study design classification
-                c_des, c_conf = st.columns([3, 1])
-                c_des.markdown(
-                    f"**Study design:** {clf.emoji} {clf.display_design}"
-                )
-                conf_colour = {"high": "🟢", "moderate": "🟡", "low": "🔴"}.get(
-                    clf.confidence, "⬜"
-                )
-                c_conf.markdown(
-                    f"**Confidence:** {conf_colour} {clf.confidence.capitalize()}"
-                )
-                if clf.signals:
-                    st.caption("Signals: " + " · ".join(clf.signals[:3]))
-
-                # ── RoB 2 (for RCTs and quasi-experimental) ───────────────────
-                if clf.rob_tool == "rob2":
-                    rob2 = _get_cached(review_id, pmid, "rob2")
-                    if (run_all or run_one) and not rob2:
-                        with st.spinner("Running RoB 2…"):
-                            ft = _get_full_text(article)
-                            rob2 = assess_rob2(abstract, ft)
-                            _set_cached(review_id, pmid, "rob2", rob2)
-                            ran_any = True
-
-                    if rob2:
-                        _render_rob2(rob2)
-
-                # ── NOS (for observational studies) ───────────────────────────
-                elif clf.rob_tool in ("nos_cohort", "nos_case_control",
-                                     "nos_cross_sectional"):
-                    nos = _get_cached(review_id, pmid, "nos")
-                    if (run_all or run_one) and not nos:
-                        with st.spinner(f"Running NOS ({clf.rob_tool})…"):
-                            ft = _get_full_text(article)
-                            nos = assess_nos(abstract, clf.rob_tool, ft)
-                            _set_cached(review_id, pmid, "nos", nos)
-                            ran_any = True
-
-                    if nos:
-                        _render_nos(nos)
-
-                elif clf.rob_tool is None:
-                    if clf.design == StudyDesign.REVIEW:
-                        st.info("📚 Systematic review / meta-analysis — "
-                                "quality assessed using AMSTAR-2 (not yet implemented). "
-                                "Use the ⭐ Quality Assessment tab for a proxy score.")
-                    else:
-                        st.info(f"No standardised RoB tool applies to {clf.display_design}. "
-                                "Use the ⭐ Quality Assessment tab for a proxy score.")
-            else:
-                if not run_all and not run_one:
-                    st.caption("Click 'Assess this article' or '▶ Assess All' to run.")
-
-    # ── Summary table ──────────────────────────────────────────────────────────
-    rob_rows, nos_rows = [], []
-    for a in articles:
-        clf = _get_cached(review_id, a["pmid"], "study_class")
-        rob = _get_cached(review_id, a["pmid"], "rob2")
-        nos = _get_cached(review_id, a["pmid"], "nos")
-
-        if rob:
-            row = {"PMID": a["pmid"], "Title": a["title"][:50],
-                   "DOI": a.get("doi") or "",
-                   "Design": clf.display_design if clf else "RCT"}
-            for dom in rob.domains:
-                row[dom.name] = f"{dom.emoji} {dom.label}"
-            row["Overall"] = f"{rob.overall_emoji} {rob.overall_label}"
-            row["Rationale"] = rob.overall_rationale
-            rob_rows.append(row)
-
-        if nos:
-            nos_rows.append({
-                "PMID": a["pmid"], "Title": a["title"][:50],
-                "DOI": a.get("doi") or "",
-                "Design": clf.display_design if clf else nos.instrument,
-                "Selection": f"{nos.selection.stars}/{nos.selection.max_stars}★",
-                "Comparability": f"{nos.comparability.stars}/{nos.comparability.max_stars}★",
-                "Outcome/Exposure": f"{nos.outcome.stars}/{nos.outcome.max_stars}★",
-                "Total": f"{nos.total_stars}/{nos.max_stars}★",
-                "Grade": f"{nos.quality_emoji} {nos.quality_label}",
-            })
-
-    if rob_rows:
-        st.divider()
-        st.markdown(f"#### RoB 2 Summary ({len(rob_rows)} RCTs)")
-        df_rob = pd.DataFrame(rob_rows)
-        st.dataframe(df_rob, use_container_width=True, hide_index=True)
-        st.download_button("📥 Export RoB 2 (CSV)",
-                           data=df_rob.to_csv(index=False),
-                           file_name=f"rob2_{review_id}.csv", mime="text/csv")
-
-    if nos_rows:
-        st.divider()
-        st.markdown(f"#### NOS Summary ({len(nos_rows)} observational studies)")
-        df_nos = pd.DataFrame(nos_rows)
-        st.dataframe(df_nos, use_container_width=True, hide_index=True)
-        st.download_button("📥 Export NOS (CSV)",
-                           data=df_nos.to_csv(index=False),
-                           file_name=f"nos_{review_id}.csv", mime="text/csv")
-
-    if run_all and ran_any:
-        st.rerun()
-
-
-def _render_rob2(rob2) -> None:
-    """Display RoB 2 result in article expander."""
-    st.markdown(
-        f"**Overall RoB 2:** {rob2.overall_emoji} **{rob2.overall_label}**"
-    )
-    st.caption(rob2.overall_rationale)
-
-    cols = st.columns(5)
-    for col, dom in zip(cols, rob2.domains):
-        col.markdown(
-            f"<div style='text-align:center'>"
-            f"<small>{dom.name.split(':')[0]}</small><br>"
-            f"<span style='font-size:1.4em'>{dom.emoji}</span><br>"
-            f"<small>{dom.label}</small></div>",
-            unsafe_allow_html=True,
-        )
-    with st.expander("🔍 Signalling questions detail", expanded=False):
-        for dom in rob2.domains:
-            st.markdown(f"**{dom.name}** — {dom.emoji} {dom.label}")
-            for sig in dom.signals:
-                st.caption(f"  · {sig}")
-            if dom.rationale:
-                st.caption(f"  → {dom.rationale}")
-
-
-def _render_nos(nos) -> None:
-    """Display NOS result in article expander."""
-    instrument_label = {
-        "nos_cohort":           "NOS Cohort",
-        "nos_case_control":     "NOS Case-Control",
-        "nos_cross_sectional":  "NOS-xs2 Cross-Sectional",
-    }.get(nos.instrument, nos.instrument)
-
-    st.markdown(
-        f"**{instrument_label}:** {nos.quality_emoji} **{nos.quality_label}** "
-        f"— {nos.total_stars}/{nos.max_stars} stars  {nos.star_display}"
-    )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Selection",
-              f"{nos.selection.stars}/{nos.selection.max_stars}★")
-    c2.metric("Comparability",
-              f"{nos.comparability.stars}/{nos.comparability.max_stars}★")
-    c3.metric("Outcome/Exposure",
-              f"{nos.outcome.stars}/{nos.outcome.max_stars}★")
-
-    with st.expander("🔍 Item detail", expanded=False):
-        for domain in [nos.selection, nos.comparability, nos.outcome]:
-            st.markdown(f"**{domain.name}**")
-            for item in domain.items:
-                st.caption(f"  {item}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 📋  GRADE / SoF TAB (NEW)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _tab_grade(review_id, articles):
-    st.markdown("### 📋 GRADE Certainty of Evidence")
-    st.caption(
-        "GRADE operates across **all included studies** for a specific outcome. "
-        "Run ⚖️ Risk of Bias and 📊 Data Pooling first for best results."
-    )
-    _render_ai_disclaimer()
-
-    with st.expander("ℹ️ GRADE certainty levels", expanded=False):
-        st.markdown("""
-| Symbol | Level | Meaning |
-|--------|-------|---------|
-| ⊕⊕⊕⊕ | **High** | Further research unlikely to change our confidence |
-| ⊕⊕⊕◯ | **Moderate** | Further research likely to have important impact |
-| ⊕⊕◯◯ | **Low** | Further research very likely to change the estimate |
-| ⊕◯◯◯ | **Very Low** | Very little confidence in the effect estimate |
-
-**Starting certainty:** RCTs → High · Observational studies → Low
-
-**Downgrade factors:** Risk of bias · Inconsistency · Indirectness · Imprecision · Publication bias
-
-**Upgrade factors (observational only):** Large effect · Dose-response relationship
-""")
-
-    # ── Outcome configuration ──────────────────────────────────────────────────
-    st.markdown("#### Configure GRADE Assessment")
-    col_out, col_design = st.columns(2)
-    with col_out:
-        outcome_name = st.text_input(
-            "Outcome to grade",
-            value="Primary outcome",
-            help="e.g. 'Overall survival', 'Complete remission rate', 'Adverse events'"
-        )
-    with col_design:
-        predominant_design = st.selectbox(
-            "Predominant study design",
-            ["rct", "observational"],
-            format_func=lambda x: "RCTs (start: High certainty)" if x == "rct"
-                                  else "Observational (start: Low certainty)",
-        )
-
-    grade_key = f"grade_{review_id}"
-
-    if st.button("▶ Run GRADE Assessment", type="primary", key="grade_run"):
-        # Gather cached RoB assessments
-        rob2_list = [r for a in articles
-                     if (r := _get_cached(review_id, a["pmid"], "rob2")) is not None]
-        nos_list  = [n for a in articles
-                     if (n := _get_cached(review_id, a["pmid"], "nos")) is not None]
-        pool_list = [r for a in articles
-                     if (sd := _get_cached(review_id, a["pmid"], "data_pool")) is not None
-                     for r in [sd.to_table_row()]]
-
-        if not rob2_list and not nos_list:
-            st.warning(
-                "⚠️ No Risk of Bias assessments found. "
-                "Run the ⚖️ Risk of Bias tab first for accurate GRADE results. "
-                "Proceeding with limited information."
-            )
-
-        with st.spinner("Computing GRADE certainty…"):
-            try:
-                grade = assess_grade(
-                    rob2_assessments=rob2_list,
-                    nos_assessments=nos_list,
-                    pooled_data=pool_list,
-                    outcome=outcome_name,
-                    study_design=predominant_design,
-                )
-                st.session_state[grade_key] = grade
-            except Exception as e:
-                logger.error("GRADE assessment failed: %s", e)
-                st.error(f"GRADE error: {e}")
-
-    if st.button("🔄 Clear GRADE", key="grade_clear"):
-        st.session_state.pop(grade_key, None)
-        st.rerun()
-
-    # ── Display GRADE result ───────────────────────────────────────────────────
-    grade = st.session_state.get(grade_key)
-    if grade:
-        st.divider()
-
-        # Main certainty banner
-        emoji = CERTAINTY_EMOJI.get(grade.final_certainty, "⬜")
-        display = CERTAINTY_DISPLAY.get(grade.final_certainty, grade.final_certainty)
-
-        st.markdown(
-            f"### {emoji} **{grade.outcome}** — Certainty: **{display}**"
-        )
-        st.info(grade.certainty_meaning)
-        st.caption(f"Rationale: {grade.certainty_rationale}")
-
-        # Summary metrics
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Studies",       grade.n_studies)
-        mc2.metric("Participants",  grade.n_participants or "NR")
-        mc3.metric("Starting",      grade.starting_certainty.upper())
-        mc4.metric("Final",         grade.final_certainty.replace("_", " ").upper())
-
-        # Factor breakdown
-        st.markdown("#### Downgrade / Upgrade Factors")
-        factor_cols = st.columns(5)
-        down_factors = [grade.risk_of_bias, grade.inconsistency,
-                        grade.indirectness, grade.imprecision, grade.publication_bias]
-
-        for col, factor in zip(factor_cols, down_factors):
-            if factor.direction == "downgrade":
-                icon = "🔴" if factor.levels == 2 else "🟡"
-                label = f"↓{factor.levels}"
-            elif factor.direction == "upgrade":
-                icon = "🟢"
-                label = f"↑{factor.levels}"
-            else:
-                icon = "🟢"
-                label = "—"
-            col.markdown(
-                f"<div style='text-align:center'>"
-                f"<small>{factor.name}</small><br>"
-                f"<span style='font-size:1.3em'>{icon}</span><br>"
-                f"<small>{label}</small></div>",
-                unsafe_allow_html=True,
-            )
-
-        # Rationale details
-        with st.expander("🔍 Factor rationales", expanded=False):
-            for f in grade.all_factors:
-                if f.direction != "none" and f.rationale:
-                    dir_str = f"{'↓' * f.levels} Downgrade" if f.direction == "downgrade" \
-                              else f"↑ Upgrade"
-                    st.markdown(f"**{f.name}** — {dir_str}")
-                    st.caption(f"  {f.rationale}")
-
-        # Summary of Findings table
-        st.divider()
-        st.markdown("#### 📋 Summary of Findings (SoF) Table")
-        st.caption("Standard Cochrane SoF format. Export for your systematic review.")
-        sof_row = grade.to_sof_row()
-        sof_df  = pd.DataFrame([sof_row])
-        st.dataframe(sof_df, use_container_width=True, hide_index=True)
-
-        c1_, c2_ = st.columns(2)
-        with c1_:
-            st.download_button(
-                "📥 Export SoF (CSV)",
-                data=sof_df.to_csv(index=False),
-                file_name=f"grade_sof_{review_id}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with c2_:
-            st.download_button(
-                "📥 Export Full GRADE (JSON)",
-                data=json.dumps(grade.to_export_dict(), indent=2),
-                file_name=f"grade_{review_id}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-        # Reporting template
-        st.divider()
-        st.markdown("#### 📝 Reporting Template")
-        st.caption("Copy this into your Methods / Results section.")
-        template = (
-            f"The certainty of evidence for {grade.outcome} was assessed using the GRADE approach. "
-            f"Based on {grade.n_studies} {'randomised trial' if predominant_design == 'rct' else 'observational stud'}{'y' if grade.n_studies == 1 else 'ies'} "
-            f"({grade.n_participants or 'N'} participants), the certainty of evidence was rated as "
-            f"**{grade.final_certainty.replace('_', ' ')}** ({CERTAINTY_DISPLAY.get(grade.final_certainty, '')}). "
-            f"{grade.certainty_rationale}"
-        )
-        st.code(template, language=None)
-
-
-# ── Helper utilities ───────────────────────────────────────────────────────────
-
-def _get_pub_types(article: dict) -> Optional[List[str]]:
-    """Extract PubMed publication types from article venue field."""
-    venue = article.get("venue") or ""
-    if not venue:
-        return None
-    return [pt.strip() for pt in venue.split(";") if pt.strip()]
-
-
-def _get_full_text(article: dict) -> str:
-    """Get full text if available (stored in session_state by full-text pipeline)."""
-    return ""   # Full text integration deferred — abstract is primary input
-
-
 
 
 ===== .\ui\screening_panel.py =====

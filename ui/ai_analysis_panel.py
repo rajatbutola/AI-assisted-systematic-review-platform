@@ -59,7 +59,7 @@
 import json
 import logging
 from typing import Any, Dict, List, Optional
-
+import re
 import pandas as pd
 import streamlit as st
 
@@ -67,7 +67,10 @@ from pipeline.data_pooler        import extract_study_data, build_composite_tabl
 from pipeline.study_classifier   import classify_study, StudyDesign
 from pipeline.rob2_assessor      import assess_rob2, RISK_EMOJI, RISK_LABEL
 from pipeline.nos_assessor       import assess_nos
-from pipeline.grade_assessor     import assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI
+from pipeline.grade_assessor     import (
+    assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI,
+    CERTAINTY_MEANING, GRADEAssessment, GRADEFactor,
+)
 from storage.repository import (
     ArticleRepository, ScreeningRepository, AdjudicationRepository,
     AIAnalysisRepository,
@@ -309,6 +312,7 @@ def _count_pending(review_id, all_articles):
 
 # ── Main entry point ───────────────────────────────────────────────────────────
 
+
 def render_ai_analysis_panel(review_id: int) -> None:
     all_articles = article_repo.get_articles_for_review(review_id)
     if not all_articles:
@@ -373,9 +377,341 @@ def render_ai_analysis_panel(review_id: int) -> None:
     with tab_pool:
         _tab_data_pool(review_id, included)
     with tab_rob:
-        _tab_risk_of_bias(review_id, included)
+        try:
+            _tab_risk_of_bias(review_id, included)
+        except Exception as e:
+            import traceback
+            st.error(f"RoB error: {type(e).__name__}: {e}")
+            st.code(traceback.format_exc())
     with tab_grade:
         _tab_grade(review_id, included)
+
+# ── Forest plot helpers ────────────────────────────────────────────────────────
+
+def _parse_effect_ci(text: str):
+    """
+    Parse (measure, estimate, ci_lo, ci_hi) from a primary_outcome_result string.
+    Handles OR/RR/HR/MD/SMD in various CI notation formats.
+    Returns None when no valid numeric data found.
+    """
+    if not text or not text.strip():
+        return None
+
+    # Normalise unicode minus / en-dash / em-dash to ASCII hyphen
+    text = (text.replace('\u2212', '-').replace('\u2013', '-')
+                .replace('\u2014', '-').replace('\u2212', '-'))
+
+    _NR_VALS = {"not reported", "nr", "na", "not applicable",
+                "not available", "—", "-", "n/a"}
+    if text.strip().lower() in _NR_VALS:
+        return None
+
+    # Detect effect measure label
+    m_meas = re.search(
+        r'\b(OR|RR|HR|SMD|MD|RD|ARR|AOR|aOR|IRR)\b', text, re.IGNORECASE
+    )
+    measure = m_meas.group(1).upper() if m_meas else "MD"
+
+    N = r'[-+]?\d+\.?\d*'   # number pattern (allows negative / decimal)
+
+    # ── Pattern 1: "1.40 (0.73 to 2.68)" ─────────────────────────────
+    m = re.search(rf'({N})\s*\(\s*({N})\s+to\s+({N})\s*\)', text, re.IGNORECASE)
+    if m:
+        try:
+            est, lo, hi = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            if lo < hi:
+                return measure, est, lo, hi
+        except ValueError:
+            pass
+
+    # ── Pattern 2: "1.40 (0.73-2.68)" or "1.40 (0.73, 2.68)" ─────────
+    m = re.search(rf'({N})\s*\(\s*({N})\s*[-,]\s*({N})\s*\)', text)
+    if m:
+        try:
+            est, lo, hi = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            if lo < hi:
+                return measure, est, lo, hi
+        except ValueError:
+            pass
+
+    # ── Pattern 3: "95% CI: 0.73–2.68" with separate estimate ─────────
+    m_ci = re.search(
+        rf'(?:95%?\s*CI[:\s]+|CI[:\s]+)({N})\s*(?:to|-|–)\s*({N})',
+        text, re.IGNORECASE
+    )
+    if m_ci:
+        pre  = text[:m_ci.start()]
+        m_e  = re.search(rf'({N})\s*$', pre.strip())
+        if not m_e:
+            m_e = re.search(rf'[=:]\s*({N})', pre)
+        if m_e:
+            try:
+                est = float(m_e.group(1))
+                lo  = float(m_ci.group(1))
+                hi  = float(m_ci.group(2))
+                if lo < hi:
+                    return measure, est, lo, hi
+            except ValueError:
+                pass
+
+    return None
+
+
+_DESIGN_COLORS = {
+    "rct":         "#3B82F6",   # blue
+    "randomis":    "#3B82F6",
+    "random":      "#3B82F6",
+    "cohort":      "#8B5CF6",   # purple
+    "case":        "#F59E0B",   # amber
+    "cross":       "#10B981",   # green
+    "observ":      "#06B6D4",   # cyan
+}
+
+
+def _design_color(design: str) -> str:
+    d = (design or "").lower()
+    for key, col in _DESIGN_COLORS.items():
+        if key in d:
+            return col
+    return "#64748B"   # slate for unknown
+
+
+def _render_forest_plot(all_sd: list, articles: list, review_id: int) -> None:
+    """
+    Render an interactive Plotly forest plot from extracted StudyData.
+    Uses primary_outcome_result to parse effect size + 95% CI per study.
+    """
+    import plotly.graph_objects as go
+    import plotly.io as pio
+
+    # Build lookups from articles list
+    year_map    = {a["pmid"]: str(a.get("year", "") or "")     for a in articles}
+    author_map  = {a["pmid"]: (a.get("authors") or [])         for a in articles}
+
+    def _label(pmid, idx):
+        auths = author_map.get(pmid, [])
+        year  = year_map.get(pmid, "")
+        if auths and auths[0] and auths[0].strip():
+            parts  = auths[0].split()
+            name   = parts[-1] if len(parts) > 1 else parts[0]
+            name   = name.rstrip(",")[:14]
+        else:
+            name = f"Study {idx + 1}"
+        return f"{name} {year}".strip()
+
+    # Parse studies
+    parsed = []
+    for idx, sd in enumerate(all_sd):
+        result = _parse_effect_ci(sd.primary_outcome_result)
+        if not result:
+            continue
+        measure, est, lo, hi = result
+
+        # Sanity: CI valid + estimate within CI
+        if lo >= hi:
+            continue
+        if measure in ("OR", "RR", "HR", "IRR", "AOR") and lo <= 0:
+            continue
+        if not (lo - 0.001 <= est <= hi + 0.001):
+            continue
+
+        # Sample size
+        try:
+            n_int = int(re.sub(r'[^\d]', '', str(sd.sample_size)))
+        except (ValueError, TypeError):
+            n_int = 0
+
+        parsed.append({
+            "label":   _label(sd.pmid, idx),
+            "pmid":    sd.pmid,
+            "measure": measure,
+            "est":     est,
+            "lo":      lo,
+            "hi":      hi,
+            "n":       n_int,
+            "n_str":   sd.sample_size if sd.sample_size not in ("Not reported", "NR") else "NR",
+            "design":  sd.study_design or "Not reported",
+            "outcome": sd.primary_outcome or "",
+            "result":  sd.primary_outcome_result or "",
+        })
+
+    if not parsed:
+        st.info(
+            "🌲 Forest plot requires parseable effect sizes (e.g. 'OR 1.40 (0.73 to 2.68)' "
+            "or 'MD −2.3 (−4.1 to −0.5)'). Run data extraction first."
+        )
+        return
+
+    # Warn if mixed measures
+    measures = {p["measure"] for p in parsed}
+    if len(measures) > 1:
+        st.warning(
+            f"⚠️ Mixed effect measures detected: {', '.join(measures)}. "
+            "Forest plots should use a single measure. "
+            "Review individual study results carefully."
+        )
+
+    # Axis type by dominant measure
+    measure   = max(measures, key=lambda m: sum(1 for p in parsed if p["measure"] == m))
+    use_log   = measure in ("OR", "RR", "HR", "IRR", "AOR")
+    null_x    = 1.0 if use_log else 0.0
+
+    n_studies = len(parsed)
+    height    = max(380, n_studies * 52 + 130)
+
+    # Marker size proportional to N (6–18 px)
+    ns = [p["n"] for p in parsed if p["n"] > 0]
+    n_min, n_max = (min(ns), max(ns)) if len(ns) > 1 else (0, 1)
+
+    def _msize(n):
+        if n <= 0 or n_max == n_min:
+            return 10
+        return int(6 + (n - n_min) / (n_max - n_min) * 12)
+
+    fig = go.Figure()
+
+    # ── Plot each study ────────────────────────────────────────────────
+    seen_designs = {}
+
+    for i, s in enumerate(parsed):
+        y     = n_studies - 1 - i    # top-to-bottom
+        color = _design_color(s["design"])
+        lbl   = s["design"] if s["design"] != "Not reported" else "Unknown design"
+        show_leg = lbl not in seen_designs
+        if show_leg:
+            seen_designs[lbl] = color
+
+        # CI line
+        fig.add_trace(go.Scatter(
+            x=[s["lo"], s["hi"]], y=[y, y],
+            mode="lines",
+            line=dict(color=color, width=2.5),
+            showlegend=False, hoverinfo="skip",
+        ))
+        # CI end caps
+        fig.add_trace(go.Scatter(
+            x=[s["lo"], s["hi"]], y=[y, y],
+            mode="markers",
+            marker=dict(symbol="line-ns-open", size=9,
+                        color=color, line=dict(color=color, width=2.5)),
+            showlegend=False, hoverinfo="skip",
+        ))
+        # Point estimate — square, sized by N
+        fig.add_trace(go.Scatter(
+            x=[s["est"]], y=[y],
+            mode="markers",
+            name=lbl,
+            legendgroup=lbl,
+            showlegend=show_leg,
+            marker=dict(
+                symbol="square",
+                size=_msize(s["n"]),
+                color=color,
+                line=dict(color="white", width=1.5),
+            ),
+            hovertemplate=(
+                f"<b>{s['label']}</b><br>"
+                f"N = {s['n_str']}<br>"
+                f"{s['measure']}: <b>{s['est']:.2f}</b> "
+                f"(95% CI: {s['lo']:.2f} – {s['hi']:.2f})<br>"
+                f"Design: {s['design']}<br>"
+                f"Outcome: {s['outcome']}<br>"
+                f"Result: {s['result']}<extra></extra>"
+            ),
+        ))
+
+    # ── Null effect line ───────────────────────────────────────────────
+    fig.add_vline(x=null_x,
+                  line=dict(color="#94A3B8", width=1.5, dash="dot"))
+
+    # ── Shading (ratio measures only) ──────────────────────────────────
+    if use_log:
+        all_x = [v for s in parsed for v in [s["lo"], s["hi"]]]
+        x_min = min(all_x) * 0.6
+        x_max = max(all_x) * 1.6
+        fig.add_vrect(x0=x_min, x1=null_x,
+                      fillcolor="#FEF2F2", opacity=0.25,
+                      layer="below", line_width=0)
+        fig.add_vrect(x0=null_x, x1=x_max,
+                      fillcolor="#F0FDF4", opacity=0.25,
+                      layer="below", line_width=0)
+
+    # ── Right-side annotation panel (N | Effect CI) ────────────────────
+    annotations = [
+        dict(x=1.02, y=1.04, xref="paper", yref="paper",
+             text="<b>N</b>", showarrow=False,
+             font=dict(size=11, color="#0F172A"), xanchor="left"),
+        dict(x=1.11, y=1.04, xref="paper", yref="paper",
+             text=f"<b>{measure} (95% CI)</b>", showarrow=False,
+             font=dict(size=11, color="#0F172A"), xanchor="left"),
+    ]
+    for i, s in enumerate(parsed):
+        y_frac = (n_studies - 1 - i + 0.5) / n_studies
+        annotations += [
+            dict(x=1.02, y=y_frac, xref="paper", yref="paper",
+                 text=s["n_str"], showarrow=False,
+                 font=dict(size=10, color="#374151"), xanchor="left"),
+            dict(x=1.11, y=y_frac, xref="paper", yref="paper",
+                 text=f"{s['est']:.2f} ({s['lo']:.2f}–{s['hi']:.2f})",
+                 showarrow=False,
+                 font=dict(size=10, color="#374151"), xanchor="left"),
+        ]
+
+    # ── Axis labels ────────────────────────────────────────────────────
+    if use_log:
+        x_title = f"← Favours control    {measure}    Favours intervention →"
+    else:
+        x_title = f"← Favours control    {measure}    Favours intervention →"
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=290, t=55, b=70),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        title=dict(
+            text=(f"Forest Plot Preview — {measure} · "
+                  f"{n_studies} {'study' if n_studies == 1 else 'studies'} · "
+                  f"Square size ∝ sample size"),
+            font=dict(size=13, color="#0F172A"),
+            x=0.0, xanchor="left",
+        ),
+        xaxis=dict(
+            title=dict(text=x_title, font=dict(size=11, color="#374151")),
+            type="log" if use_log else "linear",
+            gridcolor="#E2E8F0", gridwidth=1,
+            zeroline=False, tickfont=dict(size=10),
+            showgrid=True,
+        ),
+        yaxis=dict(
+            tickvals=list(range(n_studies)),
+            ticktext=[parsed[n_studies - 1 - i]["label"]
+                      for i in range(n_studies)],
+            tickfont=dict(size=11, color="#374151"),
+            showgrid=False,
+            range=[-0.6, n_studies - 0.4],
+        ),
+        annotations=annotations,
+        legend=dict(
+            orientation="h",
+            yanchor="top", y=-0.12,
+            xanchor="left", x=0,
+            font=dict(size=10),
+            title=dict(text="Study design  ", font=dict(size=10)),
+        ),
+        hovermode="closest",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Download as self-contained interactive HTML ────────────────────
+    _html = pio.to_html(fig, include_plotlyjs="cdn", full_html=True)
+    st.download_button(
+        "📥 Download Forest Plot (interactive HTML)",
+        data=_html,
+        file_name=f"forest_plot_{review_id}.html",
+        mime="text/html",
+    )
+
 
 
 # ── Data Pooling ───────────────────────────────────────────────────────────────
@@ -398,10 +734,10 @@ def _tab_data_pool(review_id, articles):
         )
 
     c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Extract Data from All", key="pool_all", type="primary")
-    if c2.button("🔄 Clear & Retry", key="pool_clear"):
+    run_all = c1.button("▶ Extract Data from All", key=f"pool_all_{review_id}", type="primary")
+    if c2.button("🔄 Clear & Retry", key=f"pool_clear_{review_id}"):
         _clear_task_cache(review_id, articles, "data_pool")
-        st.rerun()
+
 
     missing_abstract = 0
     ran_any          = False
@@ -531,6 +867,17 @@ def _tab_data_pool(review_id, articles):
         st.divider()
         _pool_summary(df)
 
+        # ── Forest Plot Preview ────────────────────────────────────────
+        st.divider()
+        st.markdown("#### 🌲 Forest Plot Preview")
+        st.caption(
+            "Parsed from 'Primary Result' field. "
+            "Point estimates with 95% CI — square size proportional to N. "
+            "This is a visual preview; use dedicated meta-analysis software "
+            "for pooled estimates."
+        )
+        _render_forest_plot(all_sd, articles, review_id)
+
     if run_all and ran_any:
         st.rerun()
 
@@ -586,14 +933,14 @@ Using the correct tool for each study is required by PRISMA 2020 and Cochrane gu
 """)
 
     c1, c2 = st.columns([2, 1])
-    run_all = c1.button("▶ Assess All Articles", key="rob_all", type="primary")
-    if c2.button("🔄 Clear All RoB", key="rob_clear"):
+    run_all = c1.button("▶ Assess All Articles", key=f"rob_all_{review_id}", type="primary")
+    if c2.button("🔄 Clear All RoB", key=f"rob_clear_{review_id}"):
         for a in articles:
             for t in ("study_class", "rob2", "nos"):
                 k = _ck(review_id, a["pmid"], t)
                 if k in st.session_state:
                     del st.session_state[k]
-        st.rerun()
+
 
     ran_any = False
 
@@ -751,8 +1098,6 @@ Using the correct tool for each study is required by PRISMA 2020 and Cochrane gu
         st.caption("Cochrane-style visual summary. Download as PNG for publication.")
         _render_traffic_light(review_id, articles)
 
-    if run_all and ran_any:
-        st.rerun()
 
 def _render_traffic_light(review_id, articles):
     """
@@ -884,7 +1229,7 @@ def _render_traffic_light(review_id, articles):
         margin=dict(l=160, r=20, t=60, b=120),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+        legend=dict(orientation="h", yanchor="top", y=-0.25,
                     xanchor="center", x=0.5),
         xaxis=dict(
             tickmode="array",
@@ -892,7 +1237,7 @@ def _render_traffic_light(review_id, articles):
             ticktext=studies,
             tickangle=45,
             showgrid=False, zeroline=False,
-            side="bottom",
+            side="top",
         ),
         yaxis=dict(
             tickmode="array",
@@ -911,33 +1256,9 @@ def _render_traffic_light(review_id, articles):
         ),
     )
 
-    st.plotly_chart(fig, use_container_width=True, key=f"rob_tl_{review_id}")
+    st.plotly_chart(fig)
 
-    # PNG download via kaleido
-    c1, c2 = st.columns(2)
-    with c1:
-        try:
-            import kaleido  # noqa: F401 — check availability silently
-            png = fig.to_image(format="png", scale=3,
-                               width=max(600, n_studies*70+200))
-            st.download_button("📥 Download PNG (high-res)",
-                               data=png,
-                               file_name=f"rob_traffic_light_{review_id}.png",
-                               mime="image/png", use_container_width=True)
-        except Exception:
-            st.info("💡 Install kaleido for PNG/SVG export: "
-                    "`pip install kaleido`", icon="ℹ️")
-    with c2:
-        try:
-            import kaleido  # noqa: F401
-            svg = fig.to_image(format="svg",
-                               width=max(600, n_studies*70+200))
-            st.download_button("📥 Download SVG (vector)",
-                               data=svg,
-                               file_name=f"rob_traffic_light_{review_id}.svg",
-                               mime="image/svg+xml", use_container_width=True)
-        except Exception:
-            pass  # already shown above
+
 
 
 def _render_rob2(rob2) -> None:
@@ -999,10 +1320,6 @@ def _render_nos(nos) -> None:
 
 def _tab_grade(review_id, articles):
     from pipeline.data_pooler import extract_outcome_data
-    from pipeline.grade_assessor import (
-        assess_grade, CERTAINTY_DISPLAY, CERTAINTY_EMOJI, CERTAINTY_MEANING,
-        GRADEAssessment, GRADEFactor,
-    )
 
     st.markdown('''<div class="sr-section-header">
       <div class="sr-section-icon" style="background:#F0FDF4;">📋</div>
@@ -1020,20 +1337,12 @@ def _tab_grade(review_id, articles):
 | ⊕⊕⊕⊕ | **High** | Further research unlikely to change confidence |
 | ⊕⊕⊕◯ | **Moderate** | Further research likely to have important impact |
 | ⊕⊕◯◯ | **Low** | Further research very likely to change the estimate |
-| ⊕◯◯◯ | **Very Low** | Very little confidence in the effect estimate |
+| ⊕◯◯◯ | **Very Low** | Very little confidence in the estimate |
 
-**Starting certainty:** RCTs → High · Observational studies → Low
+**Starting certainty:** RCTs → High · Observational → Low
 
-**BMJ 2025 updates applied:**
-- **Imprecision:** OIS-based (≥300 participants binary / ≥400 continuous) + CI crossing null
-- **Inconsistency:** I² AND prediction interval (wide PI crossing null → downgrade)
-- **Indirectness:** 4 domains assessed (population, intervention, comparator, outcome)
-- **Observational upgrade:** Residual confounding direction upgrade criterion
-- **Cap:** Observational studies can upgrade at most to Moderate
-
-**Downgrade factors:** Risk of bias · Inconsistency · Indirectness · Imprecision · Publication bias
-
-**Upgrade factors (observational):** Large effect · Dose-response · Residual confounding
+**BMJ 2025 updates:** OIS-based imprecision · Prediction interval for inconsistency ·
+4-domain indirectness · Residual confounding upgrade · Observational cap at Moderate
 """)
 
     # ── Split articles by study design ────────────────────────────────────────
@@ -1541,6 +1850,7 @@ def _tab_grade(review_id, articles):
                     language=None)
 
 
+
 def _build_sof_html_multi(grade_results: dict,
                            outcomes: list,
                            manual_events: dict = None) -> str:
@@ -1671,6 +1981,8 @@ def _build_sof_html_multi(grade_results: dict,
                  + "</small>")
 
     return html
+
+
 
 # ── Helper utilities ───────────────────────────────────────────────────────────
 

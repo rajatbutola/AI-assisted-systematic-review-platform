@@ -32,6 +32,7 @@
 
 import logging
 import os
+import threading
 import streamlit as st
 
 from config.settings import (
@@ -102,91 +103,55 @@ def load_model():
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
+# Global lock: llama.cpp (GGUF) is NOT thread-safe. Streamlit spawns one OS
+# thread per WebSocket event, so concurrent LLM calls crash the process with
+# a C-level GGML assertion. This lock serialises all inference calls.
+_llm_lock = threading.Lock()
+
+
 def run_inference(prompt: str, task: str = "summarization") -> str:
     """
     Run the LLM on a prompt and return the generated text.
-
-    Parameters
-    ----------
-    prompt : str
-        Full prompt string including system instructions and the abstract.
-    task : str
-        One of the keys in GENERATION_CONFIG: "summarization", "extraction",
-        "scoring".
-
-    Returns
-    -------
-    str
-        The model's generated text, with the prompt stripped if echoed.
+    Thread-safe: acquires _llm_lock before touching the model.
     """
+    with _llm_lock:
+        return _run_inference_inner(prompt, task)
+
+
+def _run_inference_inner(prompt: str, task: str) -> str:
     if task not in GENERATION_CONFIG:
         raise ValueError(
             f"Unknown task '{task}'. Valid: {list(GENERATION_CONFIG.keys())}"
         )
 
-    gen_cfg = GENERATION_CONFIG[task]
+    gen_cfg      = GENERATION_CONFIG[task]
+    backend_type, model = load_model()   # always cached — cheap call
 
-   # Truncate prompt using actual token count to prevent llama.cpp crash.
-    # The access violation (ggml assert i01 >= 0) happens when token index
-    # exceeds the model's embedding matrix size due to context overflow.
-    backend_type_check, model_check = load_model()
-    if backend_type_check == "gguf" and model_check is not None:
+    # ── Prompt truncation to prevent context overflow ──────────────────────
+    max_out    = gen_cfg.get("max_tokens", 512)
+    max_in_tok = N_CTX - max_out - 64
+
+    if backend_type == "gguf" and model is not None:
         try:
-            # Use llama.cpp's own tokenizer — exact token count
-            tokens = model_check.tokenize(prompt.encode("utf-8"))
-            gen_cfg_check = GENERATION_CONFIG.get(task, {})
-            max_out = gen_cfg_check.get("max_tokens", 512)
-            # Leave room for output + safety margin of 64 tokens
-            max_in = N_CTX - max_out - 64
-            if len(tokens) > max_in:
-                tokens = tokens[:max_in]
-                prompt = model_check.detokenize(tokens).decode("utf-8", errors="ignore")
+            tokens = model.tokenize(prompt.encode("utf-8"))
+            if len(tokens) > max_in_tok:
+                tokens = tokens[:max_in_tok]
+                prompt = model.detokenize(tokens).decode("utf-8", errors="ignore")
                 logger.warning(
-                    "Prompt truncated from %d to %d tokens for task '%s'",
-                    len(tokens), max_in, task
+                    "Prompt truncated to %d tokens for task '%s'",
+                    max_in_tok, task,
                 )
-        except Exception as e:
-            # Fallback: conservative char truncation (3 chars/token for medical text)
-            logger.warning("Token count failed (%s), using char fallback", e)
-            max_chars = (N_CTX - 600) * 3
-            if len(prompt) > max_chars:
-                prompt = prompt[:max_chars]
-                logger.warning("Prompt truncated to %d chars", max_chars)
-    else:
-        backend_type, model = load_model()
-
-        # Truncate prompt using exact token count to prevent llama.cpp crash.
-        # The C++ assert (i01 >= 0 && i01 < ne01) fires when token index
-        # exceeds the embedding matrix — caused by context overflow.
-        gen_cfg     = GENERATION_CONFIG[task]
-        max_out     = gen_cfg.get("max_tokens", 512)
-        # Safe input budget: context - output tokens - 64 token safety margin
-        max_in_tok  = N_CTX - max_out - 64
-
-        if backend_type == "gguf" and model is not None:
-            try:
-                tokens = model.tokenize(prompt.encode("utf-8"))
-                if len(tokens) > max_in_tok:
-                    tokens  = tokens[:max_in_tok]
-                    prompt  = model.detokenize(tokens).decode("utf-8", errors="ignore")
-                    logger.warning(
-                        "Prompt truncated to %d tokens (max_in=%d) for task '%s'",
-                        len(tokens), max_in_tok, task,
-                    )
-            except Exception as tok_err:
-                # Fallback: conservative char truncation (3 chars/token for medical)
-                logger.warning("Tokenizer failed (%s), using char fallback", tok_err)
-                max_chars = max_in_tok * 3
-                if len(prompt) > max_chars:
-                    prompt = prompt[:max_chars]
-                    logger.warning(
-                        "Prompt truncated to %d chars for task '%s'", max_chars, task)
-        else:
-            # Non-GGUF: char-based truncation
+        except Exception as tok_err:
+            logger.warning("Tokenizer failed (%s), using char fallback", tok_err)
             max_chars = max_in_tok * 3
             if len(prompt) > max_chars:
                 prompt = prompt[:max_chars]
+    else:
+        max_chars = max_in_tok * 3
+        if len(prompt) > max_chars:
+            prompt = prompt[:max_chars]
 
+    # ── Dispatch ───────────────────────────────────────────────────────────
     try:
         if backend_type == "gguf":
             text = _run_gguf(model, prompt, gen_cfg)
@@ -203,17 +168,16 @@ def run_inference(prompt: str, task: str = "summarization") -> str:
         logger.error("run_inference unexpected error for task '%s': %s", task, e)
         return f"[LLM Error: {type(e).__name__}: {e}]"
 
-    # Strip any accidental echo of the prompt from the beginning of the output
     text = _strip_prompt_echo(text, prompt)
-
     logger.debug("run_inference [%s] → %d chars output", task, len(text))
     return text.strip()
+
 
 
 # ── Backend implementations ───────────────────────────────────────────────────
 
 def _run_gguf(llm, prompt: str, gen_cfg: dict) -> str:
-    """Run inference using llama-cpp-python (GGUF model).
+    """Run inference using llama-cpp-python.
     Catches native C++ exceptions to prevent Streamlit process crash.
     """
     try:

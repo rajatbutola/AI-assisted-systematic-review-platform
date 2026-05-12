@@ -96,14 +96,16 @@
 
 
 import re
+import html as _html
 import json
 import logging
 import streamlit as st
 import pandas as pd
 from typing import Dict, List, Optional
- 
+
 from storage.repository import (
     ArticleRepository, ScreeningRepository, AdjudicationRepository,
+    AIAnalysisRepository,
 )
 from pipeline.pico_extractor import extract_pico
 from pipeline.summarizer     import summarize_with_llm
@@ -113,6 +115,7 @@ logger = logging.getLogger(__name__)
 article_repo      = ArticleRepository()
 screening_repo    = ScreeningRepository()
 adjudication_repo = AdjudicationRepository()
+ai_repo           = AIAnalysisRepository()
 
 def _extract_pdf_text(uploaded_file) -> tuple:
     """
@@ -221,13 +224,62 @@ def _reviewer_label(rev_id: str) -> str:
 # ── AI cache helpers ────────────────────────────────────────────────────────────
 def _ck(review_id, pmid, task):
     return f"sc_{review_id}_{pmid}_{task}"
- 
+
+def _db_task_sc(review_id, task):
+    return f"r{review_id}_{task}"
+
+def _deserialise_sc(task, raw):
+    if raw is None:
+        return None
+    try:
+        if task in ("s1_pico", "s2_pico"):
+            from pipeline.pico_extractor import PICOExtraction
+            return PICOExtraction(**{
+                k: raw.get(k) or ""
+                for k in ("population", "intervention", "comparison", "outcome")
+            })
+    except Exception:
+        pass
+    return None
+
 def _get_cached(review_id, pmid, task):
-    return st.session_state.get(_ck(review_id, pmid, task))
- 
+    # 1. Session state — fast path
+    val = st.session_state.get(_ck(review_id, pmid, task))
+    if val is not None:
+        return val
+    # 2. DB fallback — survives refresh and reconnect
+    try:
+        raw = ai_repo.get_analysis(pmid, _db_task_sc(review_id, task))
+        if raw is not None:
+            logger.debug("DB cache hit: pmid=%s task=%s", pmid, task)
+            obj = _deserialise_sc(task, raw)
+            if obj is not None:
+                st.session_state[_ck(review_id, pmid, task)] = obj
+            return obj
+        else:
+            logger.debug("DB cache miss: pmid=%s task=%s", pmid, task)
+    except Exception as e:
+        logger.warning("DB cache read failed: %s", e)
+    return None
+
 def _set_cached(review_id, pmid, task, value):
     st.session_state[_ck(review_id, pmid, task)] = value
- 
+    try:
+        if task == "s1_pico":
+            data = {
+                "population":   getattr(value, "population",   "") or "",
+                "intervention": getattr(value, "intervention", "") or "",
+                "comparison":   getattr(value, "comparison",   "") or "",
+                "outcome":      getattr(value, "outcome",      "") or "",
+            }
+        else:
+            from dataclasses import asdict
+            data = (asdict(value)
+                    if hasattr(value, "__dataclass_fields__") else value)
+        ai_repo.save_analysis(pmid, _db_task_sc(review_id, task), data)
+    except Exception as e:
+        logger.warning("Screening cache DB write failed (task=%s): %s", task, e)
+
 # ── PICO keyword highlighter ───────────────────────────────────────────────────
 def _highlight_abstract(text: str, pico_terms: list) -> str:
     """Wrap PICO keywords in yellow highlight spans (case-insensitive)."""
@@ -248,13 +300,209 @@ def _highlight_abstract(text: str, pico_terms: list) -> str:
             result
         )
     return result
- 
-def _get_pico_terms() -> list:
+
+_PICO_PALETTE = {
+    "P": ("#BFDBFE", "#1E40AF", "Population"),
+    "I": ("#BBF7D0", "#065F46", "Intervention"),
+    "C": ("#FED7AA", "#92400E", "Comparison"),
+    "O": ("#E9D5FF", "#6B21A8", "Outcome"),
+}
+
+
+
+def _pico_color_legend() -> str:
+    badges = " ".join(
+        f'<span style="background:{bg};color:{fg};border-radius:3px;'
+        f'padding:1px 7px;font-size:0.72rem;font-weight:600;">'
+        f'{ltr}: {name}</span>'
+        for ltr, (bg, fg, name) in _PICO_PALETTE.items()
+    )
+    return (
+        f'<div style="margin-bottom:0.5rem;display:flex;'
+        f'gap:0.3rem;flex-wrap:wrap;">{badges}</div>'
+    )
+
+def _compute_pico_relevance_score(review_id: int, cached_pico) -> Optional[int]:
+    """
+    0–100 score, always computable when PICO is extracted.
+
+    Component 1 — PICO completeness (always used):
+        Were P / I / C / O elements extracted with ≥2 words each?
+        P=25 I=35 C=15 O=25 points.
+
+    Component 2 — query overlap (blended in when form is set):
+        Word-level recall against the review's PICO form values.
+        Blended as 60% query + 40% completeness.
+
+    Returns None only when cached_pico is None.
+    """
+    if cached_pico is None:
+        return None
+
+    WEIGHTS = {"population": 25, "intervention": 25,
+               "comparison": 25, "outcome":      25}
+
+    extracted = {
+        k: (getattr(cached_pico, k, "") or "").strip()
+        for k in WEIGHTS
+    }
+
+    # ── Component 1: completeness ──────────────────────────────────────────
+    completeness = sum(
+        w for k, w in WEIGHTS.items()
+        if len(extracted[k].split()) >= 2        # at least 2 words = substantive
+    )
+
+    # ── Component 2: query overlap (optional enhancement) ─────────────────
+    _saved = st.session_state.get(f"pico_form_{review_id}", {})
+    query  = {k: (_saved.get(k, "") or "").lower().strip() for k in WEIGHTS}
+
+    if any(query.values()):
+        ov_score = 0.0
+        ov_wt    = 0.0
+        for k, w in WEIGHTS.items():
+            q_words = {t for t in re.split(r'\W+', query[k])          if len(t) >= 3}
+            if not q_words:
+                continue
+            e_words = {t for t in re.split(r'\W+', extracted[k].lower()) if len(t) >= 3}
+            ov_score += (len(q_words & e_words) / len(q_words)) * w
+            ov_wt    += w
+        if ov_wt > 0:
+            query_score = (ov_score / ov_wt) * 100
+            return round(0.6 * query_score + 0.4 * completeness)
+
+    return completeness   # query not set → completeness alone
+
+
+def _compute_pico_consistency(s1_pico, s2_pico) -> dict:
+    """
+    Compare Stage 1 abstract PICO vs Stage 2 full-text PICO.
+    Uses recall-based word overlap: checks how many abstract PICO
+    words appear in the full-text extraction (lenient — handles
+    cases where full text gives more detail on the same concept).
+    Returns per-element scores and an overall consistency flag.
+    """
+    ELEMENTS = ["population", "intervention", "comparison", "outcome"]
+    results  = {}
+    n_flags  = 0
+
+    for el in ELEMENTS:
+        s1 = (getattr(s1_pico, el, "") or "").strip().lower()
+        s2 = (getattr(s2_pico, el, "") or "").strip().lower()
+
+        s1_words = {w for w in re.split(r'\W+', s1) if len(w) >= 3}
+        s2_words = {w for w in re.split(r'\W+', s2) if len(w) >= 3}
+
+        if not s1_words and not s2_words:
+            score = 1.0                          # both empty → consistent
+        elif not s1_words or not s2_words:
+            score = 0.0                          # one empty → inconsistent
+        else:
+            score = len(s1_words & s2_words) / len(s1_words)
+
+        flagged = score < 0.25 and bool(s1_words)
+        if flagged:
+            n_flags += 1
+
+        results[el] = {
+            "s1":      getattr(s1_pico, el, "") or "",
+            "s2":      getattr(s2_pico, el, "") or "",
+            "score":   score,
+            "flagged": flagged,
+        }
+
+    return {"elements": results, "n_flags": n_flags,
+            "consistent": n_flags == 0}
+
+
+
+
+def _highlight_pico_extraction(abstract: str, pico) -> tuple:
+    """
+    Colour-code extracted PICO elements in the abstract.
+    Strategy: exact phrase first, then word-level fallback (≥4 chars).
+    Returns (html_str, any_highlighted: bool).
+    """
+    import html as _html
+
+    if not abstract:
+        return _html.escape(abstract or ""), False
+
+    elements = {
+        "P": (pico.population   or "").strip(),
+        "I": (pico.intervention or "").strip(),
+        "C": (pico.comparison   or "").strip(),
+        "O": (pico.outcome      or "").strip(),
+    }
+
+    abstract_lower = abstract.lower()
+    raw_spans: list = []
+
+    for label, text in elements.items():
+        if not text or len(text) < 3:
+            continue
+        text_lower = text.lower()
+
+        # Strategy 1 — exact phrase match
+        idx = abstract_lower.find(text_lower)
+        if idx >= 0:
+            raw_spans.append((idx, idx + len(text), label))
+            continue
+
+        # Strategy 2 — word-level match (handles LLM paraphrasing)
+        words = [
+            w.strip(".,;:()[]'\"") for w in text.split()
+            if len(w.strip(".,;:()[]'\"")) >= 4
+        ]
+        for word in words:
+            wl = word.lower()
+            pos = 0
+            while True:
+                i = abstract_lower.find(wl, pos)
+                if i < 0:
+                    break
+                raw_spans.append((i, i + len(word), label))
+                pos = i + 1
+
+    if not raw_spans:
+        return _html.escape(abstract), False
+
+    # Sort: earlier start first; longer span wins on tie
+    raw_spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+
+    # Resolve overlaps — first/longest span wins
+    merged: list = []
+    last_end = -1
+    for start, end, label in raw_spans:
+        if start >= last_end:
+            merged.append((start, end, label))
+            last_end = end
+
+    # Build HTML
+    parts: list = []
+    cursor = 0
+    for start, end, label in merged:
+        if start > cursor:
+            parts.append(_html.escape(abstract[cursor:start]))
+        bg, fg, name = _PICO_PALETTE[label]
+        parts.append(
+            f'<mark style="background:{bg};color:{fg};border-radius:3px;'
+            f'padding:0 3px;font-weight:500;" title="{name}">'
+            f'{_html.escape(abstract[start:end])}</mark>'
+        )
+        cursor = end
+    if cursor < len(abstract):
+        parts.append(_html.escape(abstract[cursor:]))
+
+    return "".join(parts), True
+
+def _get_pico_terms(review_id=None) -> list:
     """Extract PICO search terms from session state for highlighting."""
+    _saved = st.session_state.get(f"pico_form_{review_id}", {}) if review_id else {}
     terms = []
     for key in ["population","intervention","comparison","outcome"]:
-        val = st.session_state.get(key, "") or ""
-        if val.strip():
+        val = (_saved.get(key, "") or "").strip()
+        if val:
             terms.extend([w.strip() for w in val.split() if len(w.strip()) >= 3])
     return terms
  
@@ -268,7 +516,14 @@ def _classify_conflict(all_decisions: dict) -> str:
         return "Include vs Unsure"
     return "Exclude vs Unsure"
  
-def _sort_articles(articles, sort_key, my_decisions):
+def _sort_articles(articles, sort_key, my_decisions, review_id=None):
+    if sort_key in ("Relevance score (high → low)", "Relevance score (low → high)"):
+        def _rel_key(a):
+            pico = _get_cached(review_id, a["pmid"], "s1_pico") if review_id else None
+            s = _compute_pico_relevance_score(review_id, pico)
+            return s if s is not None else -1
+        reverse = sort_key == "Relevance score (high → low)"
+        return sorted(articles, key=_rel_key, reverse=reverse)
     if sort_key == "Pending first, then A→Z":
         return sorted(articles, key=lambda a: (0 if my_decisions.get(a["pmid"]) is None else 1,
                                                (a.get("title") or "").lower()))
@@ -340,11 +595,54 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
         sort_key = st.selectbox(
             "Sort by",
             ["Pending first, then A→Z","Decided first, then A→Z",
-             "A → Z (title)","Newest first","Oldest first"],
+             "A → Z (title)","Newest first","Oldest first",
+             "Relevance score (high → low)","Relevance score (low → high)"],
             key="s1_sort",
         )
+
     with ctrl3:
         st.metric("Progress", f"{decided_count}/{total_count}")
+
+    # ── Bulk PICO extraction ───────────────────────────────────────────────────
+    _all_articles_for_pico = article_repo.get_articles_for_review(
+        review_id, current_reviewer_id, stage="title_abstract")
+    _unextracted = [
+        a for a in _all_articles_for_pico
+        if not _get_cached(review_id, a["pmid"], "s1_pico")
+        and (a.get("abstract") or "").strip()
+    ]
+    _extracted_n = len(_all_articles_for_pico) - len(_unextracted)
+
+    ba1, ba2 = st.columns([2, 3])
+    with ba1:
+        _all_lbl = (
+            f"🔬 Extract PICO for All ({len(_unextracted)} remaining)"
+            if _unextracted else "✅ PICO extracted for all articles"
+        )
+        if st.button(_all_lbl, key=f"s1pico_all_{review_id}",
+                     type="primary", disabled=not _unextracted):
+            _prog = st.progress(0, text="Starting PICO extraction…")
+            _total = len(_unextracted)
+            for _i, _art in enumerate(_unextracted):
+                _pmid = _art["pmid"]
+                _prog.progress(
+                    _i / _total,
+                    text=f"🔬 Extracting PICO — {_i + 1} of {_total} articles…"
+                )
+                try:
+                    _res = extract_pico(_art.get("abstract", ""))
+                    _set_cached(review_id, _pmid, "s1_pico", _res)
+                except Exception as _e:
+                    logger.error("Bulk PICO failed pmid=%s: %s", _pmid, _e)
+            _prog.progress(1.0, text=f"✅ PICO extracted for {_total} articles.")
+            st.rerun()
+    with ba2:
+        if _extracted_n > 0:
+            st.caption(
+                f"✅ {_extracted_n}/{len(_all_articles_for_pico)} articles "
+                f"already have PICO extracted."
+            )
+    # ── End bulk extraction ───────────────────────────────────────────────────
     if total_count > 0:
         st.progress(decided_count/total_count)
     st.divider()
@@ -367,10 +665,37 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
         st.info(f"No articles match: {filter_view}")
         return
  
-    filtered = _sort_articles(filtered, sort_key, my_decisions)
+    filtered = _sort_articles(filtered, sort_key, my_decisions, review_id=review_id)
     st.caption(f"Showing {len(filtered)} of {total_count} articles")
-    pico_terms = _get_pico_terms()
- 
+    pico_terms = _get_pico_terms(review_id=review_id)
+
+    # ── PICO extraction queue ──────────────────────────────────────────────────
+    _pq_key = f"s1_pico_queue_{review_id}"
+    st.session_state.setdefault(_pq_key, [])
+    _pq     = st.session_state[_pq_key]
+
+    if _pq:
+        _next_pmid  = _pq[0]
+        _next_art   = next((a for a in articles if a["pmid"] == _next_pmid), None)
+        _already    = _get_cached(review_id, _next_pmid, "s1_pico")
+
+        if _next_art and not _already:
+            n = len(_pq)
+            with st.spinner(
+                f"🔬 Extracting PICO — "
+                f"{'1 article' if n == 1 else f'{n} remaining in queue'}…"
+            ):
+                try:
+                    result = extract_pico(_next_art.get("abstract", ""))
+                    _set_cached(review_id, _next_pmid, "s1_pico", result)
+                except Exception as e:
+                    logger.error("PICO queue extraction failed pmid=%s: %s",
+                                 _next_pmid, e)
+
+        st.session_state[_pq_key].pop(0)   # done (or already cached) — advance
+        st.rerun()                          # immediately process next item
+    # ── End queue ─────────────────────────────────────────────────────────────
+
     for article in filtered:
         _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                         conflict_pmids, pico_terms)
@@ -378,7 +703,9 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
  
 def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                     conflict_pmids, pico_terms):
-    pmid = article["pmid"]
+    pmid        = article["pmid"]
+    cached_pico = _get_cached(review_id, pmid, "s1_pico")   # needed by badge + abstract
+
     all_decisions = screening_repo.get_all_decisions_for_article(
         review_id, pmid, "title_abstract")
     adjudication  = adjudication_repo.get_adjudication(review_id, pmid)
@@ -403,11 +730,35 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
             st.markdown(
                 f'{badge}<span style="font-weight:600;font-size:0.9rem;color:#0F172A;">'
                 f'{article["title"]}</span>', unsafe_allow_html=True)
+            _rel_score = _compute_pico_relevance_score(review_id, cached_pico)
+            if _rel_score is not None:
+                _rb, _rf = (
+                    ("#D1FAE5", "#065F46") if _rel_score >= 70 else
+                    ("#FEF3C7", "#92400E") if _rel_score >= 40 else
+                    ("#FFE4E6", "#9F1239")
+                )
+                _rel_badge = (
+                    f'<span style="background:{_rb};color:{_rf};'
+                    f'border-radius:4px;padding:1px 8px;'
+                    f'font-size:0.75rem;font-weight:700;" '
+                    f'title="PICO relevance score">'
+                    f'{_rel_score}%</span>'
+                )
+            else:
+                _rel_badge = (
+                    '<span style="background:#F1F5F9;color:#64748B;'
+                    'border-radius:4px;padding:1px 8px;'
+                    'font-size:0.75rem;font-weight:600;" '
+                    'title="Extract PICO to see relevance score">'
+                    '?%</span>'
+                )
+
             st.markdown(
                 f'<div style="display:flex;flex-wrap:wrap;gap:0.35rem;margin-top:0.25rem;">'
                 f'<span class="sr-pill">{article.get("journal","") or "Unknown"}</span>'
                 f'<span class="sr-pill">{article.get("year","") or ""}</span>'
                 f'<span class="sr-source-badge {_src_cls}">{_src_lbl}</span>'
+                f'{_rel_badge}'
                 f'</div>', unsafe_allow_html=True)
         with s_col:
             dec = my_decision
@@ -447,38 +798,70 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
         elif has_conflict and is_arbiter:
             st.warning(f"⚠️ **Conflict:** {_classify_conflict(all_decisions)}. Resolve in Conflicts tab.")
  
-        # ── Abstract with PICO keyword highlighting ────────────────────
-        abstract = article.get("abstract") or ""
+        # ── Abstract (layered highlighting: PICO extraction > search terms > plain)
+        abstract     = article.get("abstract") or ""
+
+
         with st.expander("Abstract", expanded=True):
-            if pico_terms and abstract:
-                highlighted = _highlight_abstract(abstract, pico_terms)
+            if cached_pico and abstract:
+                pico_html, any_hit = _highlight_pico_extraction(abstract, cached_pico)
+                if any_hit:
+                    st.markdown(_pico_color_legend(), unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="font-size:0.88rem;line-height:1.65;">'
+                        f'{pico_html}</div>',
+                        unsafe_allow_html=True)
+                else:
+                    # LLM paraphrased heavily — fall back to search-term highlight
+                    body = (_highlight_abstract(abstract, pico_terms)
+                            if pico_terms else _html.escape(abstract))
+                    st.markdown(
+                        f'<div style="font-size:0.88rem;line-height:1.65;">'
+                        f'{body}</div>',
+                        unsafe_allow_html=True)
+                    st.caption(
+                        "ℹ️ PICO phrases not found verbatim — "
+                        "LLM may have paraphrased. Check the banner below.")
+            elif pico_terms and abstract:
                 st.markdown(
-                    f'<div style="font-size:0.88rem;line-height:1.65;">{highlighted}</div>',
+                    f'<div style="font-size:0.88rem;line-height:1.65;">'
+                    f'{_highlight_abstract(abstract, pico_terms)}</div>',
                     unsafe_allow_html=True)
             else:
                 st.write(abstract or "No abstract.")
- 
-        # ── Per-card PICO extractor ────────────────────────────────────
-        cached_pico = _get_cached(review_id, pmid, "s1_pico")
+
+        # ── Per-card PICO extractor (queue-based) ─────────────────────
+        _pq_key   = f"s1_pico_queue_{review_id}"
+        _queue    = st.session_state.get(_pq_key, [])
+        _in_queue = pmid in _queue
+        _q_pos    = (_queue.index(pmid) + 1) if _in_queue else 0
+
         pc1, pc2 = st.columns([1, 4])
-        if pc1.button("🔬 Extract PICO", key=f"s1pico_{pmid}", type="secondary"):
-            with st.spinner("Extracting PICO…"):
-                try:
-                    result = extract_pico(abstract)
-                    _set_cached(review_id, pmid, "s1_pico", result)
-                    cached_pico = result
-                except Exception as e:
-                    st.error(f"PICO error: {e}")
+        if _in_queue:
+            pc1.button(f"⏳ #{_q_pos} in queue", key=f"s1pico_{pmid}",
+                       type="secondary", disabled=True)
+        else:
+            _lbl = "🔄 Re-extract" if cached_pico else "🔬 Extract PICO"
+            if pc1.button(_lbl, key=f"s1pico_{pmid}", type="secondary"):
+                st.session_state.setdefault(_pq_key, [])
+                if pmid not in st.session_state[_pq_key]:
+                    st.session_state[_pq_key].append(pmid)
+                st.rerun()
+
         if cached_pico:
             with pc2.container():
                 p = cached_pico
                 st.markdown(
-                    f'<div style="background:#F0FDF4;border:1px solid #BBF7D0;'
+                    f'<div style="background:#F8FAFF;border:1px solid #BFDBFE;'
                     f'border-radius:8px;padding:0.6rem 0.9rem;font-size:0.82rem;">'
-                    f'<b>P:</b> {p.population or "—"} &nbsp;|&nbsp; '
-                    f'<b>I:</b> {p.intervention or "—"} &nbsp;|&nbsp; '
-                    f'<b>C:</b> {p.comparison or "—"} &nbsp;|&nbsp; '
-                    f'<b>O:</b> {p.outcome or "—"}</div>',
+                    f'<b style="color:#1E40AF;">P:</b> {p.population or "—"}'
+                    f' &nbsp;|&nbsp; '
+                    f'<b style="color:#065F46;">I:</b> {p.intervention or "—"}'
+                    f' &nbsp;|&nbsp; '
+                    f'<b style="color:#92400E;">C:</b> {p.comparison or "—"}'
+                    f' &nbsp;|&nbsp; '
+                    f'<b style="color:#6B21A8;">O:</b> {p.outcome or "—"}'
+                    f'</div>',
                     unsafe_allow_html=True)
  
         # ── BELOW ABSTRACT: Reason → Note → Decision → Submit ─────────
@@ -748,8 +1131,96 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                     "💡 Retrieve via Search → Full Texts, or upload PDF above."
                 )
 
+        # ── PICO Consistency Check ─────────────────────────────────────
+        s1_pico = _get_cached(review_id, pmid, "s1_pico")
+        s2_pico = _get_cached(review_id, pmid, "s2_pico")
+
+        if s1_pico:
+            _PICO_LABELS = {
+                "population":   "Population",
+                "intervention": "Intervention",
+                "comparison":   "Comparison",
+                "outcome":      "Outcome",
+            }
+            pc1, pc2 = st.columns([1, 4])
+            _btn_lbl = (
+                "🔄 Re-check PICO" if s2_pico else "🔍 Check PICO Consistency"
+            )
+            if pc1.button(_btn_lbl, key=f"s2pico_{pmid}",
+                          type="secondary"):
+                _src_text = (full_text[:3000] if has_ft
+                             else article.get("abstract", ""))
+                if not _src_text:
+                    st.warning("No text available for PICO extraction.")
+                else:
+                    _label = ("full text" if has_ft else "abstract")
+                    with st.spinner(
+                        f"Extracting PICO from {_label} for comparison…"
+                    ):
+                        try:
+                            s2_pico = extract_pico(_src_text)
+                            _set_cached(review_id, pmid, "s2_pico", s2_pico)
+                        except Exception as _e:
+                            st.error(f"PICO extraction error: {_e}")
+
+            if s2_pico:
+                _cx = _compute_pico_consistency(s1_pico, s2_pico)
+
+                with pc2.container():
+                    if _cx["consistent"]:
+                        st.markdown(
+                            '<div style="background:#D1FAE5;border:1px solid '
+                            '#6EE7B7;border-radius:8px;padding:0.45rem 0.9rem;'
+                            'font-size:0.82rem;">'
+                            '✅ <b>PICO consistent</b> — abstract and '
+                            'full text describe the same study elements.'
+                            '</div>',
+                            unsafe_allow_html=True)
+                    else:
+                        _flagged_names = [
+                            _PICO_LABELS[el]
+                            for el, v in _cx["elements"].items()
+                            if v["flagged"]
+                        ]
+                        _verb = ("differs" if len(_flagged_names) == 1
+                                 else "differ")
+                        st.markdown(
+                            f'<div style="background:#FEF3C7;border:1px solid '
+                            f'#FCD34D;border-radius:8px;padding:0.45rem 0.9rem;'
+                            f'font-size:0.82rem;">'
+                            f'⚠️ <b>PICO discrepancy</b> — '
+                            f'<b>{", ".join(_flagged_names)}</b> {_verb} '
+                            f'between abstract and full text. '
+                            f'Verify carefully before including.'
+                            f'</div>',
+                            unsafe_allow_html=True)
+
+                with st.expander(
+                    "🔍 PICO comparison (abstract vs full text)",
+                    expanded=_cx["n_flags"] > 0
+                ):
+                    for el, v in _cx["elements"].items():
+                        _icon = "⚠️" if v["flagged"] else "✅"
+                        _score_pct = round(v["score"] * 100)
+                        st.markdown(
+                            f'**{_icon} {_PICO_LABELS[el]}** '
+                            f'<span style="font-size:0.75rem;color:#6B7280;">'
+                            f'({_score_pct}% overlap)</span>',
+                            unsafe_allow_html=True)
+                        c_s1, c_s2 = st.columns(2)
+                        c_s1.caption("Abstract")
+                        c_s1.markdown(v["s1"] or "*—not extracted—*")
+                        c_s2.caption("Full text")
+                        c_s2.markdown(v["s2"] or "*—not extracted—*")
+                        st.divider()
+        elif not s1_pico:
+            st.caption(
+                "💡 Extract PICO in Stage 1 to enable consistency checking here."
+            )
+
         # ── Per-card AI Summariser ─────────────────────────────────────
         cached_sum = _get_cached(review_id, pmid, "s2_summary")
+        
         sc1, sc2 = st.columns([1,4])
         if sc1.button("📝 Summarise", key=f"s2sum_{pmid}", type="secondary"):
             text_to_summarise = (full_text[:4000] if has_ft
