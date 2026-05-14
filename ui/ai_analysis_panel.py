@@ -390,32 +390,64 @@ def render_ai_analysis_panel(review_id: int) -> None:
 
 def _parse_effect_ci(text: str):
     """
-    Parse (measure, estimate, ci_lo, ci_hi) from a primary_outcome_result string.
-    Handles OR/RR/HR/MD/SMD in various CI notation formats.
-    Returns None when no valid numeric data found.
+    Parse (measure, estimate, ci_lo, ci_hi) from any result string.
+    
+    Rule: only attempts parsing when a recognised effect measure label
+    is present (OR, HR, RR, MD, SMD etc.) — prevents false positives
+    from survival times, percentages, and narrative text.
+    Returns None when no valid measure+CI pair is found.
     """
     if not text or not text.strip():
         return None
 
-    # Normalise unicode minus / en-dash / em-dash to ASCII hyphen
+    # Normalise unicode dashes, thin spaces, en-dashes
     text = (text.replace('\u2212', '-').replace('\u2013', '-')
-                .replace('\u2014', '-').replace('\u2212', '-'))
+                .replace('\u2014', '-').replace('\u2009', ' ')
+                .replace('\u00a0', ' '))
 
-    _NR_VALS = {"not reported", "nr", "na", "not applicable",
-                "not available", "—", "-", "n/a"}
-    if text.strip().lower() in _NR_VALS:
+    _NR = {"not reported", "nr", "na", "not applicable",
+           "not available", "—", "-", "n/a", "none", ""}
+    if text.strip().lower() in _NR:
         return None
 
-    # Detect effect measure label
-    m_meas = re.search(
-        r'\b(OR|RR|HR|SMD|MD|RD|ARR|AOR|aOR|IRR)\b', text, re.IGNORECASE
+    # ── Step 1: detect effect measure label (required) ────────────────
+    _MEASURE_MAP = {
+        "hazard ratio": "HR",  "adjusted hazard ratio": "HR",  "ahr": "HR",
+        "odds ratio":   "OR",  "adjusted odds ratio":   "OR",  "aor": "OR",
+        "risk ratio":   "RR",  "relative risk":         "RR",  "arr": "ARR",
+        "mean difference": "MD", "standardised mean difference": "SMD",
+        "standardized mean difference": "SMD",
+        "risk difference": "RD",  "rate ratio": "RR",
+        "irr": "IRR",
+        # abbreviations
+        "hr": "HR", "or": "OR", "rr": "RR", "md": "MD", "smd": "SMD",
+        "rd": "RD",
+    }
+    measure = None
+    m_pos   = len(text)    # position of measure label in text
+
+    # Try long-form labels first (most specific)
+    for label in sorted(_MEASURE_MAP, key=len, reverse=True):
+        pat = re.compile(
+            r'\b' + re.escape(label) + r'\b', re.IGNORECASE
+        )
+        m = pat.search(text)
+        if m:
+            measure = _MEASURE_MAP[label]
+            m_pos   = m.end()
+            break
+
+    if not measure:
+        return None    # no recognised effect measure → can't plot
+
+    N = r'[-+]?\d+\.?\d*'   # number including negatives and decimals
+
+    # ── Step 2: find estimate + CI using multiple pattern strategies ───
+
+    # Pattern A: "1.76 (1.02 to 3.04)" — explicit "to"
+    m = re.search(
+        rf'({N})\s*\(\s*({N})\s+to\s+({N})\s*\)', text, re.IGNORECASE
     )
-    measure = m_meas.group(1).upper() if m_meas else "MD"
-
-    N = r'[-+]?\d+\.?\d*'   # number pattern (allows negative / decimal)
-
-    # ── Pattern 1: "1.40 (0.73 to 2.68)" ─────────────────────────────
-    m = re.search(rf'({N})\s*\(\s*({N})\s+to\s+({N})\s*\)', text, re.IGNORECASE)
     if m:
         try:
             est, lo, hi = float(m.group(1)), float(m.group(2)), float(m.group(3))
@@ -424,7 +456,7 @@ def _parse_effect_ci(text: str):
         except ValueError:
             pass
 
-    # ── Pattern 2: "1.40 (0.73-2.68)" or "1.40 (0.73, 2.68)" ─────────
+    # Pattern B: "1.76 (1.02-3.04)" or "1.76 (1.02, 3.04)"
     m = re.search(rf'({N})\s*\(\s*({N})\s*[-,]\s*({N})\s*\)', text)
     if m:
         try:
@@ -434,16 +466,17 @@ def _parse_effect_ci(text: str):
         except ValueError:
             pass
 
-    # ── Pattern 3: "95% CI: 0.73–2.68" with separate estimate ─────────
+    # Pattern C: "1.76, 95% CI[/confidence interval], 1.02-3.04"
+    # Handles: "aHR 1.76, 95% confidence interval [CI], 1.02-3.04"
     m_ci = re.search(
-        rf'(?:95%?\s*CI[:\s]+|CI[:\s]+)({N})\s*(?:to|-|–)\s*({N})',
+        rf'(?:95%?\s*(?:confidence interval|CI)\s*[\[\(]?(?:CI)?\s*[\]\)]?'
+        rf'[,\s]+)({N})\s*[-–,to]+\s*({N})',
         text, re.IGNORECASE
     )
     if m_ci:
-        pre  = text[:m_ci.start()]
-        m_e  = re.search(rf'({N})\s*$', pre.strip())
-        if not m_e:
-            m_e = re.search(rf'[=:]\s*({N})', pre)
+        # Estimate is the number immediately after the measure label
+        between = text[m_pos: m_ci.start()]
+        m_e = re.search(rf'[=:\s,]?\s*({N})', between)
         if m_e:
             try:
                 est = float(m_e.group(1))
@@ -454,7 +487,27 @@ def _parse_effect_ci(text: str):
             except ValueError:
                 pass
 
-    return None
+    # Pattern D: "95% CI: a to b" or "95% CI: a–b" anywhere in text
+    m_ci2 = re.search(
+        rf'95%?\s*CI[:\s]+({N})\s*(?:[-–]|to)\s*({N})',
+        text, re.IGNORECASE
+    )
+    if m_ci2:
+        before = text[:m_ci2.start()]
+        m_e = re.search(rf'({N})\s*$', before.rstrip())
+        if not m_e:
+            m_e = re.search(rf'[=:\s]({N})', before[m_pos:])
+        if m_e:
+            try:
+                est = float(m_e.group(1))
+                lo  = float(m_ci2.group(1))
+                hi  = float(m_ci2.group(2))
+                if lo < hi:
+                    return measure, est, lo, hi
+            except ValueError:
+                pass
+
+    return None   # measure found but no parseable CI
 
 
 _DESIGN_COLORS = {
@@ -535,12 +588,39 @@ def _render_forest_plot(all_sd: list, articles: list, review_id: int) -> None:
             "result":  sd.primary_outcome_result or "",
         })
 
+    n_total      = len(all_sd)
+    n_no_result  = sum(1 for s in all_sd
+                       if not s.primary_outcome_result
+                       or s.primary_outcome_result.strip().lower()
+                       in ("not reported", "nr", "none", "—", ""))
+    n_no_measure = sum(1 for s in all_sd
+                       if s.primary_outcome_result
+                       and s.primary_outcome_result.strip().lower()
+                       not in ("not reported", "nr", "none", "—", "")
+                       and _parse_effect_ci(s.primary_outcome_result) is None)
+
     if not parsed:
         st.info(
-            "🌲 Forest plot requires parseable effect sizes (e.g. 'OR 1.40 (0.73 to 2.68)' "
-            "or 'MD −2.3 (−4.1 to −0.5)'). Run data extraction first."
+            f"🌲 **Forest plot not available** — "
+            f"{n_total} studies extracted, but none report a formal effect "
+            f"measure (OR, HR, RR, MD, SMD) with a 95% confidence interval "
+            f"in a parseable format.\n\n"
+            f"- **{n_no_result}** studies: result not reported in abstract\n"
+            f"- **{n_no_measure}** studies: result reported as percentage, "
+            f"survival time, p-value, or narrative text (not plottable)\n\n"
+            f"Forest plots require all studies to share a common effect "
+            f"measure with CI. If the full texts contain formal statistics, "
+            f"the Stage 2 data extraction may yield better results with a "
+            f"stronger model."
         )
         return
+
+    if len(parsed) < n_total:
+        st.caption(
+            f"ℹ️ Showing {len(parsed)} of {n_total} studies — "
+            f"{n_total - len(parsed)} excluded (no parseable effect measure + CI). "
+            f"Hover each point for full details."
+        )
 
     # Warn if mixed measures
     measures = {p["measure"] for p in parsed}
