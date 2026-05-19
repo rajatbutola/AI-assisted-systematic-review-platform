@@ -219,8 +219,8 @@ from typing import Dict, List, Optional
 
 import plotly.graph_objects as go
 import streamlit as st
-
 from storage.repository import ArticleRepository, ScreeningRepository, PrismaSettingsRepository
+from utils.i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -377,9 +377,11 @@ def render_prisma_diagram(review_id: int) -> None:
     s2_counts        = article_repo.get_stage2_counts(review_id)
 
 
-    diag_tab, cust_tab, export_tab = st.tabs(
-        ["📊 Diagram", "🎨 Customise", "📥 Export"]
-    )
+    diag_tab, cust_tab, export_tab = st.tabs([
+        t("prisma_diagram"),
+        t("prisma_customise"),
+        t("prisma_export"),
+    ])
     with diag_tab:
         _render_diagram_tab(review_id, counts, db_settings, mode_key, reason_counts, s2_counts, s2_reason_counts)
     with cust_tab:
@@ -398,13 +400,13 @@ def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=Non
     c_radio, c_hint = st.columns([2, 4])
     with c_radio:
         new_mode = st.radio(
-            "Style", ["colour", "bw"],
+            t("style_label"), ["colour", "bw"],
             index=0 if current_mode == "colour" else 1,
-            format_func=lambda x: "🎨 Colour" if x == "colour" else "⬛ B&W",
+            format_func=lambda x: t("colour_style") if x == "colour" else t("bw_style"),
             key=f"mode_radio_{review_id}", horizontal=True,
         )
     with c_hint:
-        st.caption("Switch style instantly. Save in 🎨 Customise → Apply Changes.")
+        st.caption(t("switch_style_hint"))
     if new_mode != st.session_state[mode_key]:
         st.session_state[mode_key] = new_mode
 
@@ -419,8 +421,12 @@ def _render_diagram_tab(review_id, counts, settings, mode_key, reason_counts=Non
     )
     screened = incl + excl + uns
     cols = st.columns(6)
-    for col, lbl, val in zip(cols,
-        ["Identified","Screened","✅ Included","❌ Excluded","🟡 Unsure","⏳ Pending"],
+    _prisma_labels = [
+        t("prisma_identified"), t("prisma_screened"),
+        f"✅ {t('included')}", f"❌ {t('excluded')}",
+        f"🟡 {t('unsure')}", f"⏳ {t('pending')}",
+    ]
+    for col, lbl, val in zip(cols, _prisma_labels,
         [id_, screened, incl, excl, uns, pend]
     ):
         col.metric(lbl, val)
@@ -1011,8 +1017,8 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
     new_eb       = dict(eb)
 
     # ── 1. Database Sources ────────────────────────────────────────────
-    with st.expander("🗄️ Database Sources", expanded=False):
-        st.caption("These appear in the Identification boxes. Auto-filled from search. Click Apply to save.")
+    with st.expander(t("db_sources"), expanded=False):
+        st.caption(t("db_sources_hint"))
         databases_ss = st.session_state.get(db_list_key, [])
         updated_dbs  = []
         for i, db in enumerate(databases_ss):
@@ -1029,7 +1035,7 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
             else:
                 updated_dbs.append({"name": db_name, "n": db_n})
 
-        if st.button("➕ Add Database", key=f"add_db_{rid}"):
+        if st.button(t("btn_add_db"), key=f"add_db_{rid}"):
             st.session_state[add_db_flag] = True
             st.session_state[db_list_key] = updated_dbs + [{"name": "", "n": 0}]
             st.rerun()
@@ -1037,12 +1043,12 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
             st.session_state[db_list_key] = updated_dbs
             st.session_state[add_db_flag] = False
 
-        new_other_n = st.number_input("Additional records (other sources)",
+        new_other_n = st.number_input(t("additional_sources"),
                                       value=int(settings.get("additional_sources_n", 0)),
                                       min_value=0, key=f"other_n_{rid}")
 
     # ── 2. Box Colours ─────────────────────────────────────────────────
-    with st.expander("🎨 Box Colours (Colour mode)", expanded=False):
+    with st.expander(t("box_colours"), expanded=False):
         BOX_KEYS = [
             ("identification", "Identification"), ("screening", "Screening"),
             ("eligibility",    "Eligibility"),    ("included",  "Included"),
@@ -1061,32 +1067,29 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
                     key=f"cp_text_{rid}_{key}")
 
     # ── 3. Layout & Spacing ────────────────────────────────────────────
-    with st.expander("📐 Layout, Spacing & Arrows", expanded=False):
-        st.markdown("**Box dimensions** (paper coordinates 0–1)")
+    with st.expander(t("layout_spacing"), expanded=False):
+        st.markdown(f"**{t('box_dimensions')}**")
         r1c1, r1c2, r1c3 = st.columns(3)
-        new_bw_  = r1c1.slider("Main box width",  0.20, 0.55, new_bw_,  0.01, key=f"sl_bw_{rid}")
-        new_bh_  = r1c2.slider("Box height",      0.04, 0.18, new_bh_,  0.01, key=f"sl_bh_{rid}")
-        new_sbw_ = r1c3.slider("Side box width",  0.10, 0.40, new_sbw_, 0.01, key=f"sl_sbw_{rid}")
-        st.markdown("**Spacing**")
+        new_bw_  = r1c1.slider(t("main_box_width"), 0.20, 0.55, new_bw_,  0.01, key=f"sl_bw_{rid}")
+        new_bh_  = r1c2.slider(t("box_height"), 0.04, 0.18, new_bh_,  0.01, key=f"sl_bh_{rid}")
+        new_sbw_ = r1c3.slider(t("side_box_width"), 0.10, 0.40, new_sbw_, 0.01, key=f"sl_sbw_{rid}")
+        st.markdown(f"**{t('spacing_section')}**")
         r2c1, r2c2 = st.columns(2)
-        new_vg_ = r2c1.slider("Vertical gap between boxes", 0.04, 0.28, new_vg_, 0.01, key=f"sl_vg_{rid}",
+        new_vg_ = r2c1.slider(t("vertical_gap"), 0.04, 0.28, new_vg_, 0.01, key=f"sl_vg_{rid}",
                                help="Gap between bottom of one box and top of next.")
-        new_hg_ = r2c2.slider("Horizontal gap (main→side)", 0.01, 0.20, new_hg_, 0.01, key=f"sl_hg_{rid}",
+        new_hg_ = r2c2.slider(t("horizontal_gap"), 0.01, 0.20, new_hg_, 0.01, key=f"sl_hg_{rid}",
                                help="Gap between right edge of main box and left edge of side box.")
-        st.markdown("**Stage label position**")
-        new_lx_ = st.slider("Stage label column X", 0.01, 0.12, new_lx_, 0.005, key=f"sl_lx_{rid}",
+        st.markdown(f"**{t('stage_label_pos')}**")
+        new_lx_ = st.slider(t("stage_label_x"), 0.01, 0.12, new_lx_, 0.005, key=f"sl_lx_{rid}",
                              help="Horizontal position of the Identification/Screening/... labels.")
-        st.markdown("**Arrows**")
+        st.markdown(f"**{t('arrows_section')}**")
         r3c1, r3c2 = st.columns(2)
-        new_aw_      = r3c1.slider("Arrow width (px)", 1, 5, new_aw_, key=f"sl_aw_{rid}")
-        new_show_uns = r3c2.checkbox("Show unsure/full-text exclusion box",
+        new_aw_      = r3c1.slider(t("arrow_width"), 1, 5, new_aw_, key=f"sl_aw_{rid}")
+        new_show_uns = r3c2.checkbox(t("show_unsure_box_label"),
                                      value=new_show_uns, key=f"cb_uns_{rid}")
     # ── 3b. Per-Box Size Overrides ─────────────────────────────────────
-    with st.expander("📦 Per-Box Size & Spacing Overrides", expanded=False):
-        st.caption(
-            "Override width/height for individual boxes. "
-            "Leave W and H at 0 to use the global setting above."
-        )
+    with st.expander(t("per_box_size"), expanded=False):
+        st.caption(t("per_box_override_hint"))
         _box_sizes_cur = settings.get("box_sizes", {})
         _BOX_KEYS_SIZES = [
             ("identification", "Records after deduplication (main)"),
@@ -1099,9 +1102,9 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
         ]
         # Header row
         hc1, hc2, hc3 = st.columns([2, 1, 1])
-        hc1.caption("**Box**")
-        hc2.caption("**Width**")
-        hc3.caption("**Height**")
+        hc1.caption(f"**{t('box_label')}**")
+        hc2.caption(f"**{t('width_label')}**")
+        hc3.caption(f"**{t('height_label')}**")
 
         new_box_sizes = {}
         for bkey, blabel in _BOX_KEYS_SIZES:
@@ -1125,8 +1128,8 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
                 new_box_sizes[bkey] = entry
 
         st.divider()
-        st.markdown("**Per-pair horizontal gap** (main box → side box)")
-        st.caption("Overrides the global horizontal gap for specific rows. 0 = use global.")
+        st.markdown(t("per_h_gap_title"))
+        st.caption(t("per_h_gap_hint"))
         _hgaps_cur = settings.get("h_gaps", {})
         _HGAP_PAIRS = [
             ("ident_hg",   "Deduplication row  (main → Duplicates Removed)"),
@@ -1147,8 +1150,8 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
                 new_h_gaps[gkey] = _og
 
         st.divider()
-        st.markdown("**Per-pair vertical gap** (between specific box pairs)")
-        st.caption("Overrides the global vertical gap for specific transitions. 0 = use global.")
+        st.markdown(t("per_v_gap_title"))
+        st.caption(t("per_v_gap_hint"))
         _vgaps_cur = settings.get("v_gaps", {})
         _VGAP_PAIRS = [
             ("src_ident_vg",  "Source boxes → Records after deduplication"),
@@ -1170,21 +1173,21 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
                 new_v_gaps[vkey] = _ov
 
     # ── 4. Typography ──────────────────────────────────────────────────
-    with st.expander("🔤 Typography", expanded=False):
-        st.markdown("**Box text**")
+    with st.expander(t("typography"), expanded=False):
+        st.markdown(t("box_text_label"))
         tc1, tc2 = st.columns(2)
-        new_fs_ = tc1.slider("Font size", 8, 18, new_fs_, key=f"sl_fs_{rid}")
+        new_fs_ = tc1.slider(t("font_size"), 8, 18, new_fs_, key=f"sl_fs_{rid}")
         ff_idx  = FONT_FAMILIES.index(new_ff_) if new_ff_ in FONT_FAMILIES else 0
-        new_ff_ = tc2.selectbox("Font family", FONT_FAMILIES, index=ff_idx, key=f"sel_ff_{rid}")
-        st.markdown("**Stage labels**")
+        new_ff_ = tc2.selectbox(t("font_family"), FONT_FAMILIES, index=ff_idx, key=f"sel_ff_{rid}")
+        st.markdown(t("stage_labels_section"))
         lc1, lc2 = st.columns(2)
-        new_lfs_ = lc1.slider("Label font size", 6, 16, new_lfs_, key=f"sl_lfs_{rid}")
+        new_lfs_ = lc1.slider(t("label_font_size"), 6, 16, new_lfs_, key=f"sl_lfs_{rid}")
         lff_idx  = FONT_FAMILIES.index(new_lff_) if new_lff_ in FONT_FAMILIES else 0
-        new_lff_ = lc2.selectbox("Label font family", FONT_FAMILIES, index=lff_idx, key=f"sel_lff_{rid}")
+        new_lff_ = lc2.selectbox(t("label_font_family"), FONT_FAMILIES, index=lff_idx, key=f"sel_lff_{rid}")
 
     # ── 5. Custom Labels ───────────────────────────────────────────────
-    with st.expander("✏️ Custom Labels", expanded=False):
-        st.caption("Leave blank for auto-generated labels.")
+    with st.expander(t("custom_labels"), expanded=False):
+        st.caption(t("leave_blank_auto"))
         LABEL_KEYS = [
             ("identification", "Identification"),
             ("screening",      "Screening"),
@@ -1198,30 +1201,30 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
         for key, label in LABEL_KEYS:
             new_labels[key] = st.text_input(label,
                 value=settings.get("custom_labels", {}).get(key, ""),
-                placeholder="Leave blank for auto", key=f"lbl_{rid}_{key}")
+                placeholder=t("leave_blank_auto2"), key=f"lbl_{rid}_{key}")
         new_labels = {k: v for k, v in new_labels.items() if v.strip()}
 
     # ── 6. Extra Custom Box ────────────────────────────────────────────
-    with st.expander("➕ Extra Custom Box", expanded=False):
-        eb_en = st.checkbox("Enable extra box", value=bool(eb.get("enabled", False)),
+    with st.expander(t("extra_custom_box"), expanded=False):
+        eb_en = st.checkbox(t("enable_extra_box"), value=bool(eb.get("enabled", False)),
                             key=f"eb_en_{rid}")
         if eb_en:
             eb_txt = st.text_area("Box text (HTML: <b>bold</b>)",
                                   value=eb.get("text", "Custom Box"),
                                   key=f"eb_txt_{rid}", height=70)
             ep1, ep2 = st.columns(2)
-            eb_x = ep1.slider("X (left→right)", 0.05, 0.95, float(eb.get("x", 0.50)), 0.01, key=f"eb_x_{rid}")
-            eb_y = ep2.slider("Y (bottom→top)", 0.02, 0.98, float(eb.get("y", 0.10)), 0.01, key=f"eb_y_{rid}")
-            eb_ov = st.checkbox("Override size", value=bool(eb.get("override_size")), key=f"eb_ov_{rid}")
+            eb_x = ep1.slider(t("x_position"), 0.05, 0.95, float(eb.get("x", 0.50)), 0.01, key=f"eb_x_{rid}")
+            eb_y = ep2.slider(t("y_position"), 0.02, 0.98, float(eb.get("y", 0.10)), 0.01, key=f"eb_y_{rid}")
+            eb_ov = st.checkbox(t("override_size"), value=bool(eb.get("override_size")), key=f"eb_ov_{rid}")
             if eb_ov:
                 es1, es2 = st.columns(2)
-                eb_ws = es1.slider("Width scale", 0.3, 2.5, float(eb.get("w_scale", 1.0)), 0.05, key=f"eb_ws_{rid}")
-                eb_hs = es2.slider("Height scale", 0.3, 2.5, float(eb.get("h_scale", 1.0)), 0.05, key=f"eb_hs_{rid}")
+                eb_ws = es1.slider(t("width_scale"), 0.3, 2.5, float(eb.get("w_scale", 1.0)), 0.05, key=f"eb_ws_{rid}")
+                eb_hs = es2.slider(t("height_scale"), 0.3, 2.5, float(eb.get("h_scale", 1.0)), 0.05, key=f"eb_hs_{rid}")
             else:
                 eb_ws = eb.get("w_scale", 1.0)
                 eb_hs = eb.get("h_scale", 1.0)
             ec1, ec2, ec3 = st.columns(3)
-            eb_inh = ec1.checkbox("Inherit colours", value=not bool(eb.get("fill")), key=f"eb_inh_{rid}")
+            eb_inh = ec1.checkbox(t("inherit_colours"), value=not bool(eb.get("fill")), key=f"eb_inh_{rid}")
             if eb_inh:
                 eb_fill = ""; eb_fc_ = ""
             else:
@@ -1229,13 +1232,13 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
                 eb_fc_  = ec3.color_picker("Text", value=eb.get("font_color") or "#FFFFFF",           key=f"eb_fc_{rid}")
             at1, at2 = st.columns(2)
             arrow_to_idx = STANDARD_BOXES.index(eb.get("arrow_to","None")) if eb.get("arrow_to") in STANDARD_BOXES else 0
-            eb_at  = at1.selectbox("Connect to", STANDARD_BOXES, index=arrow_to_idx, key=f"eb_at_{rid}")
-            eb_adir = at2.radio("Arrow direction", ["from extra → box", "from box → extra"],
+            eb_at  = at1.selectbox(t("connect_to"), STANDARD_BOXES, index=arrow_to_idx, key=f"eb_at_{rid}")
+            eb_adir = at2.radio(t("arrow_direction"), [t("from_extra_to_box"), t("from_box_to_extra")],
                                 index=0 if eb.get("arrow_direction","from")=="from" else 1, key=f"eb_adir_{rid}")
             new_eb = {"enabled": True, "text": eb_txt, "x": eb_x, "y": eb_y,
                       "override_size": eb_ov, "w_scale": eb_ws, "h_scale": eb_hs,
                       "fill": eb_fill, "font_color": eb_fc_,
-                      "arrow_to": eb_at, "arrow_direction": "from" if "from extra" in eb_adir else "to"}
+                      "arrow_to": eb_at, "arrow_direction": "from" if eb_adir == t("from_extra_to_box") else "to"}
         else:
             new_eb = dict(eb); new_eb["enabled"] = False
 
@@ -1290,8 +1293,8 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
 
     # ── Live preview ───────────────────────────────────────────────────
     st.divider()
-    st.markdown("#### 👁️ Live Preview")
-    st.caption("All changes reflected instantly. Click **Apply Changes** to save.")
+    st.markdown(f"#### {t('live_preview')}")
+    st.caption(t("all_changes_instant"))
     counts  = article_repo.get_screening_counts(review_id)
     reason_counts_pre    = screening_repo.get_exclusion_reason_counts(review_id, "title_abstract")
     s2_reason_counts_pre = screening_repo.get_exclusion_reason_counts(review_id, "full_text")
@@ -1305,25 +1308,25 @@ def _render_customisation_panel(review_id, settings, mode_key, db_list_key, add_
 
     b1, b2 = st.columns(2)
     with b1:
-        if st.button("💾 Apply Changes", type="primary", use_container_width=True, key=f"apply_{rid}"):
+        if st.button(f"💾 {t('btn_apply_changes')}", type="primary", use_container_width=True, key=f"apply_{rid}"):
             settings_repo.save_settings(review_id, preview)
             st.session_state[add_db_flag] = False
-            st.success("✅ Settings saved.")
+            st.success(t("settings_saved"))
             st.rerun()
     with b2:
-        if st.button("↩️ Reset to Defaults", use_container_width=True, key=f"reset_{rid}"):
+        if st.button(f"↩️ {t('btn_reset_defaults')}", use_container_width=True, key=f"reset_{rid}"):
             settings_repo.reset_settings(review_id)
             st.session_state[mode_key]   = "colour"
             st.session_state[db_list_key] = []
             st.session_state[add_db_flag] = False
-            st.success("Reset to defaults.")
+            st.success(t("reset_done"))
             st.rerun()
 
 
 # ── Export panel ──────────────────────────────────────────────────────────────
 
 def _render_export_panel(review_id, settings, counts):
-    st.markdown("#### Export")
+    st.markdown(t("export_section"))
 
     # Use live search counts for databases, same as Diagram and Customise tabs
     live_search_db = st.session_state.get(f"prisma_db_{review_id}", {})

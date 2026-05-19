@@ -109,7 +109,17 @@ from storage.repository import (
 )
 from pipeline.pico_extractor import extract_pico
 from pipeline.summarizer     import summarize_with_llm
- 
+from utils.i18n import t
+
+def _dlabel(decision: str) -> str:
+    """Return translated decision label."""
+    return {
+        "include": t("decision_include"),
+        "exclude": t("decision_exclude"),
+        "unsure":  t("decision_unsure"),
+        None:      t("decision_pending"),
+    }.get(decision, t("decision_pending"))
+
 logger = logging.getLogger(__name__)
  
 article_repo      = ArticleRepository()
@@ -154,30 +164,75 @@ REVIEWER_DISPLAY = {
     "rev_reviewer_3":"Reviewer 3","rev_editor":"Editor",
 }
  
-EXCLUDE_REASONS = {
-    "Wrong population":"wrong_population","Wrong intervention":"wrong_intervention",
-    "Wrong comparator":"wrong_comparator","Wrong outcome":"wrong_outcome",
-    "Wrong study design":"wrong_study_design","Animal study":"animal_study",
-    "Conference abstract":"conference_abstract","Duplicate":"duplicate",
-    "Language barrier":"language_barrier","Sample size too small":"small_sample",
-    "No control group":"no_control","Other":"other",
+# Internal code → always English (used for DB storage)
+_EXCLUDE_CODES = {
+    "Wrong population":    "wrong_population",
+    "Wrong intervention":  "wrong_intervention",
+    "Wrong comparator":    "wrong_comparator",
+    "Wrong outcome":       "wrong_outcome",
+    "Wrong study design":  "wrong_study_design",
+    "Animal study":        "animal_study",
+    "Conference abstract": "conference_abstract",
+    "Duplicate":           "duplicate",
+    "Language barrier":    "language_barrier",
+    "Sample size too small":"small_sample",
+    "No control group":    "no_control",
+    "Other":               "other",
 }
- 
-UNSURE_REASONS = {
-    "Unclear population":"unclear_population","Unclear outcome":"unclear_outcome",
-    "Needs full text":"needs_full_text","Borderline design":"borderline_design",
-    "Possibly duplicate":"possibly_duplicate","Other":"other",
+_UNSURE_CODES = {
+    "Unclear population":  "unclear_population",
+    "Unclear outcome":     "unclear_outcome",
+    "Needs full text":     "needs_full_text",
+    "Borderline design":   "borderline_design",
+    "Possibly duplicate":  "possibly_duplicate",
+    "Other":               "other",
 }
- 
-FULLTEXT_EXCLUDE_REASONS = {
+_FULLTEXT_EXCLUDE_CODES = {
     "Wrong outcome measure":"wrong_outcome_measure",
     "Insufficient follow-up":"insufficient_followup",
-    "Data not extractable":"data_not_extractable",
-    "Protocol deviation":"protocol_deviation",
-    "No control group":"no_control","Wrong population":"wrong_population",
-    "Wrong intervention":"wrong_intervention","Animal study":"animal_study",
-    "Other":"other",
+    "Data not extractable": "data_not_extractable",
+    "Protocol deviation":   "protocol_deviation",
+    "No control group":     "no_control",
+    "Wrong population":     "wrong_population",
+    "Wrong intervention":   "wrong_intervention",
+    "Animal study":         "animal_study",
+    "Other":                "other",
 }
+
+# Translation key mapping — English label → i18n key
+_REASON_T_KEYS = {
+    "Wrong population":    "reason_wrong_population",
+    "Wrong intervention":  "reason_wrong_intervention",
+    "Wrong comparator":    "reason_wrong_comparator",
+    "Wrong outcome":       "reason_wrong_outcome",
+    "Wrong study design":  "reason_wrong_study_design",
+    "Animal study":        "reason_animal_study",
+    "Conference abstract": "reason_conference_abstract",
+    "Duplicate":           "reason_duplicate",
+    "Language barrier":    "reason_language_barrier",
+    "Sample size too small":"reason_small_sample",
+    "No control group":    "reason_no_control",
+    "Other":               "reason_other",
+    "Unclear population":  "reason_unclear_population",
+    "Unclear outcome":     "reason_unclear_outcome",
+    "Needs full text":     "reason_needs_full_text",
+    "Borderline design":   "reason_borderline_design",
+    "Possibly duplicate":  "reason_possibly_duplicate",
+    "Wrong outcome measure":"reason_wrong_outcome_measure",
+    "Insufficient follow-up":"reason_insufficient_followup",
+    "Data not extractable": "reason_data_not_extractable",
+    "Protocol deviation":   "reason_protocol_deviation",
+}
+
+def _translated_reasons(codes_dict: dict) -> dict:
+    """Return {translated_label: internal_code} for current language."""
+    return {t(_REASON_T_KEYS.get(lbl, lbl)): code
+            for lbl, code in codes_dict.items()}
+
+# Public dicts — translated labels mapping to internal codes
+def EXCLUDE_REASONS():        return _translated_reasons(_EXCLUDE_CODES)
+def UNSURE_REASONS():         return _translated_reasons(_UNSURE_CODES)
+def FULLTEXT_EXCLUDE_REASONS():return _translated_reasons(_FULLTEXT_EXCLUDE_CODES)
  
 # ── Reason helpers ─────────────────────────────────────────────────────────────
 def _parse_reason(reason_str: str) -> tuple:
@@ -196,7 +251,7 @@ def _render_reason_display(reason_str: str, decision: str) -> None:
     tags, note = _parse_reason(reason_str)
     if not tags and not note:
         return
-    all_reasons = {**EXCLUDE_REASONS, **UNSURE_REASONS, **FULLTEXT_EXCLUDE_REASONS}
+    all_reasons = {**(EXCLUDE_REASONS()), **UNSURE_REASONS(), **FULLTEXT_EXCLUDE_REASONS()}
     _tag_bg = {"exclude":"#FFE4E6","unsure":"#FEF3C7","include":"#D1FAE5"}
     _tag_fg = {"exclude":"#9F1239","unsure":"#92400E","include":"#065F46"}
     bg = _tag_bg.get(decision,"#F0EEE9")
@@ -265,7 +320,7 @@ def _get_cached(review_id, pmid, task):
 def _set_cached(review_id, pmid, task, value):
     st.session_state[_ck(review_id, pmid, task)] = value
     try:
-        if task == "s1_pico":
+        if task in ("s1_pico", "s2_pico"):
             data = {
                 "population":   getattr(value, "population",   "") or "",
                 "intervention": getattr(value, "intervention", "") or "",
@@ -301,12 +356,20 @@ def _highlight_abstract(text: str, pico_terms: list) -> str:
         )
     return result
 
+# _PICO_PALETTE = {
+#     "P": ("#BFDBFE", "#1E40AF", "Population"),
+#     "I": ("#BBF7D0", "#065F46", "Intervention"),
+#     "C": ("#FED7AA", "#92400E", "Comparison"),
+#     "O": ("#E9D5FF", "#6B21A8", "Outcome"),
+# }
+
 _PICO_PALETTE = {
-    "P": ("#BFDBFE", "#1E40AF", "Population"),
-    "I": ("#BBF7D0", "#065F46", "Intervention"),
-    "C": ("#FED7AA", "#92400E", "Comparison"),
-    "O": ("#E9D5FF", "#6B21A8", "Outcome"),
+    "P": ("#FECACA", "#991B1B", "Population"),    # Red
+    "I": ("#FED7AA", "#92400E", "Intervention"),   # Orange
+    "C": ("#FEF08A", "#713F12", "Comparison"),     # Yellow
+    "O": ("#BBF7D0", "#065F46", "Outcome"),        # Green
 }
+
 
 
 
@@ -324,55 +387,24 @@ def _pico_color_legend() -> str:
 
 def _compute_pico_relevance_score(review_id: int, cached_pico) -> Optional[int]:
     """
-    0–100 score, always computable when PICO is extracted.
-
-    Component 1 — PICO completeness (always used):
-        Were P / I / C / O elements extracted with ≥2 words each?
-        P=25 I=35 C=15 O=25 points.
-
-    Component 2 — query overlap (blended in when form is set):
-        Word-level recall against the review's PICO form values.
-        Blended as 60% query + 40% completeness.
-
-    Returns None only when cached_pico is None.
+    0–100 score. 25 points per non-empty extracted PICO element.
+    P=25, I=25, C=25, O=25.
+    All 4 extracted → 100%. 3 → 75%. 2 → 50%. 1 → 25%.
     """
     if cached_pico is None:
         return None
 
-    WEIGHTS = {"population": 25, "intervention": 25,
-               "comparison": 25, "outcome":      25}
-
-    extracted = {
-        k: (getattr(cached_pico, k, "") or "").strip()
-        for k in WEIGHTS
+    WEIGHTS = {
+        "population":   25,
+        "intervention": 25,
+        "comparison":   25,
+        "outcome":      25,
     }
 
-    # ── Component 1: completeness ──────────────────────────────────────────
-    completeness = sum(
+    return sum(
         w for k, w in WEIGHTS.items()
-        if len(extracted[k].split()) >= 2        # at least 2 words = substantive
+        if (getattr(cached_pico, k, "") or "").strip()
     )
-
-    # ── Component 2: query overlap (optional enhancement) ─────────────────
-    _saved = st.session_state.get(f"pico_form_{review_id}", {})
-    query  = {k: (_saved.get(k, "") or "").lower().strip() for k in WEIGHTS}
-
-    if any(query.values()):
-        ov_score = 0.0
-        ov_wt    = 0.0
-        for k, w in WEIGHTS.items():
-            q_words = {t for t in re.split(r'\W+', query[k])          if len(t) >= 3}
-            if not q_words:
-                continue
-            e_words = {t for t in re.split(r'\W+', extracted[k].lower()) if len(t) >= 3}
-            ov_score += (len(q_words & e_words) / len(q_words)) * w
-            ov_wt    += w
-        if ov_wt > 0:
-            query_score = (ov_score / ov_wt) * 100
-            return round(0.6 * query_score + 0.4 * completeness)
-
-    return completeness   # query not set → completeness alone
-
 
 def _compute_pico_consistency(s1_pico, s2_pico) -> dict:
     """
@@ -415,12 +447,43 @@ def _compute_pico_consistency(s1_pico, s2_pico) -> dict:
             "consistent": n_flags == 0}
 
 
-
+_HIGHLIGHT_STOPWORDS = frozenset({
+    # 5+ char common English words
+    "their", "there", "these", "those", "which", "while", "where",
+    "about", "after", "among", "other", "using", "being", "given",
+    "found", "shown", "based", "first", "three", "years", "lower",
+    "upper", "prior", "since", "never", "every", "often", "still",
+    "could", "would", "should", "might", "shall", "until", "under",
+    "above", "below", "along", "between", "before", "during", "within",
+    "through", "against", "without", "despite", "following", "including",
+    # Generic clinical/trial words (too common to be meaningful highlights)
+    "patient", "patients", "disease", "cancer", "tumor", "tumour",
+    "clinical", "treatment", "treated", "therapy", "therapies",
+    "analysis", "results", "outcome", "overall", "primary", "secondary",
+    "response", "survival", "related", "associated", "compared",
+    "reported", "observed", "significant", "significantly",
+    "received", "receiving", "administered", "enrolled", "included",
+    "study", "studies", "trial", "trials", "group", "groups",
+    "cohort", "median", "months", "weeks", "cases", "levels",
+    "higher", "lower", "rates", "total", "cells",
+})
 
 def _highlight_pico_extraction(abstract: str, pico) -> tuple:
     """
     Colour-code extracted PICO elements in the abstract.
-    Strategy: exact phrase first, then word-level fallback (≥4 chars).
+
+    Three strategies, all consistent: FIRST occurrence only.
+
+      1. Exact phrase match — find() returns first occurrence naturally.
+
+      2. Comma-split — splits "OS, EFS, relapse, and NRM" into individual
+         sub-terms and exact-matches each one separately. Handles short
+         acronyms (OS, EFS, NRM) with no length restriction.
+
+      3. Word-level last resort — significant words (≥5 chars, not in
+         stopwords), first occurrence only. Only reached when strategies
+         1 and 2 both fail entirely.
+
     Returns (html_str, any_highlighted: bool).
     """
     import html as _html
@@ -429,56 +492,91 @@ def _highlight_pico_extraction(abstract: str, pico) -> tuple:
         return _html.escape(abstract or ""), False
 
     elements = {
-        "P": (pico.population   or "").strip(),
-        "I": (pico.intervention or "").strip(),
-        "C": (pico.comparison   or "").strip(),
-        "O": (pico.outcome      or "").strip(),
+        "P": (getattr(pico, "population",   "") or "").strip(),
+        "I": (getattr(pico, "intervention", "") or "").strip(),
+        "C": (getattr(pico, "comparison",   "") or "").strip(),
+        "O": (getattr(pico, "outcome",      "") or "").strip(),
     }
 
     abstract_lower = abstract.lower()
+    # (start, end, label, priority)  priority: 0=exact, 1=sub-term, 2=word
     raw_spans: list = []
 
     for label, text in elements.items():
-        if not text or len(text) < 3:
+        if not text or len(text) < 2:
             continue
         text_lower = text.lower()
 
-        # Strategy 1 — exact phrase match
+        # ── Strategy 1: exact phrase (first occurrence) ────────────────
         idx = abstract_lower.find(text_lower)
         if idx >= 0:
-            raw_spans.append((idx, idx + len(text), label))
+            raw_spans.append((idx, idx + len(text), label, 0))
             continue
 
-        # Strategy 2 — word-level match (handles LLM paraphrasing)
-        words = [
-            w.strip(".,;:()[]'\"") for w in text.split()
-            if len(w.strip(".,;:()[]'\"")) >= 4
+        # ── Strategy 2: comma-split sub-terms (each exact-matched) ─────
+        # "OS, EFS, relapse, and NRM" → ["OS","EFS","relapse","NRM"]
+        sub_terms = [
+            s.strip().strip(".,;-()[]\"'")
+            for s in re.split(
+                r',|\band\b|\bor\b|\bwho\b|\bwhich\b|\bthat\b'
+                r'|\bafter\b|\bbefore\b|\bwhen\b|\bwhile\b|\bsince\b',
+                text, flags=re.IGNORECASE
+            )
+            if s.strip().strip(".,;-()[]\"'")
         ]
-        for word in words:
-            wl = word.lower()
-            pos = 0
-            while True:
-                i = abstract_lower.find(wl, pos)
-                if i < 0:
-                    break
-                raw_spans.append((i, i + len(word), label))
-                pos = i + 1
+        # Only use sub-term strategy when there are genuinely multiple terms
+        found_sub = False
+        if len(sub_terms) > 1 or (len(sub_terms) == 1
+                                   and sub_terms[0].lower() != text_lower):
+            for sub in sub_terms:
+                if len(sub) < 2:
+                    continue
+                sub_lower = sub.lower()
+                # Use word boundary for short terms to avoid partial matches
+                if len(sub) <= 4:
+                    m = re.search(
+                        r'\b' + re.escape(sub_lower) + r'\b',
+                        abstract_lower
+                    )
+                    if m:
+                        raw_spans.append((m.start(), m.start() + len(sub),
+                                          label, 1))
+                        found_sub = True
+                else:
+                    idx2 = abstract_lower.find(sub_lower)
+                    if idx2 >= 0:
+                        raw_spans.append((idx2, idx2 + len(sub), label, 1))
+                        found_sub = True
+
+        if found_sub:
+            continue
+
+        # ── Strategy 3: word-level, first occurrence only ──────────────
+        sig_words = [
+            w.strip(".,;:()[]'\"/-") for w in text.split()
+            if len(w.strip(".,;:()[]'\"/-")) >= 5
+            and w.strip(".,;:()[]'\"/-").lower() not in _HIGHLIGHT_STOPWORDS
+        ]
+        for word in sig_words:
+            idx3 = abstract_lower.find(word.lower())   # first only — no loop
+            if idx3 >= 0:
+                raw_spans.append((idx3, idx3 + len(word), label, 2))
 
     if not raw_spans:
         return _html.escape(abstract), False
 
-    # Sort: earlier start first; longer span wins on tie
-    raw_spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    # ── Resolve overlaps ──────────────────────────────────────────────
+    # earlier start → higher priority → longer span
+    raw_spans.sort(key=lambda s: (s[0], s[3], -(s[1] - s[0])))
 
-    # Resolve overlaps — first/longest span wins
     merged: list = []
     last_end = -1
-    for start, end, label in raw_spans:
+    for start, end, label, _ in raw_spans:
         if start >= last_end:
             merged.append((start, end, label))
             last_end = end
 
-    # Build HTML
+    # ── Build HTML ────────────────────────────────────────────────────
     parts: list = []
     cursor = 0
     for start, end, label in merged:
@@ -495,6 +593,7 @@ def _highlight_pico_extraction(abstract: str, pico) -> tuple:
         parts.append(_html.escape(abstract[cursor:]))
 
     return "".join(parts), True
+
 
 def _get_pico_terms(review_id=None) -> list:
     """Extract PICO search terms from session state for highlighting."""
@@ -549,15 +648,14 @@ def render_screening_panel(review_id: int) -> None:
  
     if not is_arbiter:
         st.info(
-            f"🔒 **Blinded screening** — you are **{_reviewer_label(current_reviewer_id)}**. "
-            "Switch to **Editor** to view all decisions and resolve conflicts."
+            t("blinded_msg").format(reviewer=_reviewer_label(current_reviewer_id))
         )
  
     subtabs = st.tabs([
-        "📋 Stage 1 — Title/Abstract",
-        "📄 Stage 2 — Full Text",
-        "⚠️ Conflicts",
-        "📊 Agreement & Summary",
+        t("tab_s1"),
+        t("tab_s2"),
+        t("tab_conflicts"),
+        t("tab_agreement"),
     ])
  
     with subtabs[0]:
@@ -577,7 +675,7 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
     articles = article_repo.get_articles_for_review(review_id, current_reviewer_id,
                                                      stage="title_abstract")
     if not articles:
-        st.info("No articles to screen. Run a search first.")
+        st.info(t("no_articles"))
         return
  
     my_decisions = {a["pmid"]: a.get("decision") for a in articles}
@@ -587,21 +685,35 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
     # Controls
     ctrl1, ctrl2, ctrl3 = st.columns([3, 3, 1])
     with ctrl1:
-        filter_view = st.radio(
-            "Show:", ["All","Pending","Decided","Conflicts (Editor)"],
+        _S1_FILTER_KEYS = ["All", "Pending", "Decided", "Conflicts (Editor)"]
+        _S1_FILTER_TK   = ["all", "pending", "decided", "conflicts_editor"]
+        _fi = st.radio(
+            t("show"),
+            options=range(len(_S1_FILTER_KEYS)),
+            format_func=lambda i: t(_S1_FILTER_TK[i]),
             index=0, horizontal=True, key="s1_filter",
         )
+        filter_view = _S1_FILTER_KEYS[_fi]
     with ctrl2:
-        sort_key = st.selectbox(
-            "Sort by",
-            ["Pending first, then A→Z","Decided first, then A→Z",
-             "A → Z (title)","Newest first","Oldest first",
-             "Relevance score (high → low)","Relevance score (low → high)"],
+        _S1_SORT_KEYS = [
+            "Pending first, then A→Z", "Decided first, then A→Z",
+            "A → Z (title)", "Newest first", "Oldest first",
+            "Relevance score (high → low)", "Relevance score (low → high)",
+        ]
+        _S1_SORT_TK = [
+            "sort_pending_az", "sort_decided_az", "sort_a_z",
+            "sort_newest", "sort_oldest", "sort_rel_high", "sort_rel_low",
+        ]
+        _si = st.selectbox(
+            t("sort_by"),
+            options=range(len(_S1_SORT_KEYS)),
+            format_func=lambda i: t(_S1_SORT_TK[i]),
             key="s1_sort",
         )
+        sort_key = _S1_SORT_KEYS[_si]
 
     with ctrl3:
-        st.metric("Progress", f"{decided_count}/{total_count}")
+        st.metric(t("progress_metric"), f"{decided_count}/{total_count}")
 
     # ── Bulk PICO extraction ───────────────────────────────────────────────────
     _all_articles_for_pico = article_repo.get_articles_for_review(
@@ -616,8 +728,8 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
     ba1, ba2 = st.columns([2, 3])
     with ba1:
         _all_lbl = (
-            f"🔬 Extract PICO for All ({len(_unextracted)} remaining)"
-            if _unextracted else "✅ PICO extracted for all articles"
+            f"{t('bulk_extract_all')} ({len(_unextracted)} remaining)"
+            if _unextracted else t("already_extracted")
         )
         if st.button(_all_lbl, key=f"s1pico_all_{review_id}",
                      type="primary", disabled=not _unextracted):
@@ -639,8 +751,10 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
     with ba2:
         if _extracted_n > 0:
             st.caption(
-                f"✅ {_extracted_n}/{len(_all_articles_for_pico)} articles "
-                f"already have PICO extracted."
+                t("pico_already_extracted").format(
+                    n=_extracted_n,
+                    total=len(_all_articles_for_pico)
+                )
             )
     # ── End bulk extraction ───────────────────────────────────────────────────
     if total_count > 0:
@@ -662,11 +776,11 @@ def _render_stage1(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
         filtered.append(a)
  
     if not filtered:
-        st.info(f"No articles match: {filter_view}")
+        st.info(f"{t('no_articles_match')} {t(_S1_FILTER_TK[_fi])}")
         return
  
     filtered = _sort_articles(filtered, sort_key, my_decisions, review_id=review_id)
-    st.caption(f"Showing {len(filtered)} of {total_count} articles")
+    st.caption(f"{t('showing')} {len(filtered)} {t('of')} {total_count} {t('articles')}")
     pico_terms = _get_pico_terms(review_id=review_id)
 
     # ── PICO extraction queue ──────────────────────────────────────────────────
@@ -769,7 +883,7 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                 f'padding:0.5rem;border:1px solid {_fg}33;">'
                 f'<div style="font-size:1.1rem;">{DECISION_EMOJI.get(dec,"○")}</div>'
                 f'<div style="font-size:0.7rem;font-weight:600;color:{_fg};'
-                f'text-transform:uppercase;">{DECISION_LABEL.get(dec,"Pending")}</div>'
+                f'text-transform:uppercase;">{_dlabel(dec)}</div>'
                 f'</div>', unsafe_allow_html=True)
  
         # ── Blinded / arbiter decision grid ───────────────────────────
@@ -780,29 +894,30 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                 col.markdown(
                     f"<div style='text-align:center'><small>{_reviewer_label(rev_id)}</small><br>"
                     f"<span style='font-size:1.4em'>{DECISION_EMOJI.get(dec,'⬜')}</span><br>"
-                    f"<small><b>{DECISION_LABEL.get(dec,'Pending')}</b></small></div>",
+                    f"<small><b>{_dlabel(dec)}</b></small></div>",
                     unsafe_allow_html=True)
         elif not is_arbiter:
             others = sum(1 for k,v in primary.items()
                          if k!=current_reviewer_id and v is not None)
             total_o= sum(1 for k in primary if k!=current_reviewer_id)
             if total_o>0:
-                st.caption(f"🔒 {others}/{total_o} other reviewer(s) screened (decisions hidden).")
+                st.caption(t("other_reviewers_screened").format(
+                    n=others, total=total_o))
  
         # ── Adjudication notice ────────────────────────────────────────
         if is_adjudicated and is_arbiter:
             final  = adjudication["final_decision"]
             st.success(
-                f"✅ **Resolved:** {DECISION_EMOJI.get(final,'')} {final.capitalize()}"
+                f"{t('resolved_label')} {DECISION_EMOJI.get(final,'')} {_dlabel(final)}"
                 + (f" · *{adjudication['notes']}*" if adjudication.get("notes") else ""))
         elif has_conflict and is_arbiter:
-            st.warning(f"⚠️ **Conflict:** {_classify_conflict(all_decisions)}. Resolve in Conflicts tab.")
+            st.warning(f"{t('conflict_label')} {_classify_conflict(all_decisions)}. {t('resolve_in_tab')}")
  
         # ── Abstract (layered highlighting: PICO extraction > search terms > plain)
         abstract     = article.get("abstract") or ""
 
 
-        with st.expander("Abstract", expanded=True):
+        with st.expander(t("abstract"), expanded=True):
             if cached_pico and abstract:
                 pico_html, any_hit = _highlight_pico_extraction(abstract, cached_pico)
                 if any_hit:
@@ -841,7 +956,7 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
             pc1.button(f"⏳ #{_q_pos} in queue", key=f"s1pico_{pmid}",
                        type="secondary", disabled=True)
         else:
-            _lbl = "🔄 Re-extract" if cached_pico else "🔬 Extract PICO"
+            _lbl = t("btn_re_extract") if cached_pico else t("btn_extract_pico")
             if pc1.button(_lbl, key=f"s1pico_{pmid}", type="secondary"):
                 st.session_state.setdefault(_pq_key, [])
                 if pmid not in st.session_state[_pq_key]:
@@ -877,10 +992,10 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
  
             # Reason tags for exclude/unsure
             if _effective in ("exclude","unsure"):
-                _rmap = EXCLUDE_REASONS if _effective=="exclude" else UNSURE_REASONS
-                st.markdown('<div style="font-size:0.72rem;font-weight:600;'
-                    'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.3rem;">'
-                    'Reason (select all that apply)</div>', unsafe_allow_html=True)
+                _rmap = EXCLUDE_REASONS() if _effective=="exclude" else UNSURE_REASONS()
+                st.markdown(f'<div style="font-size:0.72rem;font-weight:600;'
+                    f'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.3rem;">'
+                    f'{t("reason")}</div>', unsafe_allow_html=True)
                 tcols = st.columns(3)
                 _sel = list(_saved_tags)
                 for i,(lbl,key) in enumerate(_rmap.items()):
@@ -892,25 +1007,25 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                 _sel = list(_saved_tags)
  
             # Note
-            _note = st.text_input("📝 Note (optional)", value=_saved_note,
+            _note = st.text_input(t("note_optional"), value=_saved_note,
                 key=f"s1note_{pmid}_{current_reviewer_id}",
-                placeholder="Read abstract → extract PICO → add note → decide → Submit")
+                placeholder=t("placeholder_s2_note"))
  
             # Decision + Submit buttons
-            st.markdown('<div style="font-size:0.72rem;font-weight:600;'
-                'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.25rem;">'
-                'Decision</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:0.72rem;font-weight:600;'
+                f'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.25rem;">'
+                f'{t("decision")}</div>', unsafe_allow_html=True)
             b1,b2,b3,bsub = st.columns([2,2,2,3])
  
-            if b1.button("✅ Include", key=f"s1inc_{pmid}_{current_reviewer_id}",
+            if b1.button(t("btn_include"), key=f"s1inc_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="include" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="include" else "include"
                 st.rerun()
-            if b2.button("❌ Exclude", key=f"s1exc_{pmid}_{current_reviewer_id}",
+            if b2.button(t("btn_exclude"), key=f"s1exc_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="exclude" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="exclude" else "exclude"
                 st.rerun()
-            if b3.button("❓ Unsure", key=f"s1uns_{pmid}_{current_reviewer_id}",
+            if b3.button(t("btn_unsure"),  key=f"s1uns_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="unsure" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="unsure" else "unsure"
                 st.rerun()
@@ -918,7 +1033,7 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
             _reason_to_save = _build_reason(_sel, _note)
             _can_submit = _effective is not None
             if bsub.button(
-                "💾 Submit" if _pending is not None else "💾 Update",
+                t("btn_submit") if _pending is not None else t("btn_update"),
                 key=f"s1sub_{pmid}_{current_reviewer_id}",
                 type="primary" if _can_submit else "secondary",
                 use_container_width=True, disabled=not _can_submit):
@@ -937,7 +1052,7 @@ def _render_s1_card(article, review_id, current_reviewer_id, is_arbiter,
                 row = screening_repo.get_decision_with_reason(
                     review_id, pmid, "title_abstract", rev_id)
                 if row and row.get("reason"):
-                    st.caption(f"**{_reviewer_label(rev_id)}** reasoning:")
+                    st.caption(f"**{_reviewer_label(rev_id)}** {t('reviewer_reasoning')}")
                     _render_reason_display(row["reason"], dec)
  
         st.divider()
@@ -978,9 +1093,9 @@ def _render_stage2(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
  
     # Summary metrics
     mc1,mc2,mc3 = st.columns(3)
-    mc1.metric("Passed Stage 1", total2)
-    mc2.metric("Have Full Text", len(ft_pmids))
-    mc3.metric("Stage 2 Progress", f"{decided2}/{total2}")
+    mc1.metric(t("passed_stage1"), total2)
+    mc2.metric(t("have_full_text"), len(ft_pmids))
+    mc3.metric(t("stage2_progress"), f"{decided2}/{total2}")
     if total2 > 0:
         st.progress(decided2/total2)
     st.divider()
@@ -992,12 +1107,25 @@ def _render_stage2(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
     # Controls
     ctrl1, ctrl2 = st.columns([3,3])
     with ctrl1:
-        f2 = st.radio("Show:", ["All","Pending","Decided"],
-                      index=0, horizontal=True, key="s2_filter")
+        _S2_FILTER_KEYS = ["All", "Pending", "Decided"]
+        _S2_FILTER_TK   = ["all", "pending", "decided"]
+        _fi2 = st.radio(
+            t("show"),
+            options=range(len(_S2_FILTER_KEYS)),
+            format_func=lambda i: t(_S2_FILTER_TK[i]),
+            index=0, horizontal=True, key="s2_filter",
+        )
+        f2 = _S2_FILTER_KEYS[_fi2]
     with ctrl2:
-        s2_sort = st.selectbox("Sort by",
-            ["Pending first, then A→Z","A → Z (title)","Newest first"],
-            key="s2_sort")
+        _S2_SORT_KEYS = ["Pending first, then A→Z", "A → Z (title)", "Newest first"]
+        _S2_SORT_TK   = ["sort_pending_az", "sort_a_z", "sort_newest"]
+        _si2 = st.selectbox(
+            t("sort_by"),
+            options=range(len(_S2_SORT_KEYS)),
+            format_func=lambda i: t(_S2_SORT_TK[i]),
+            key="s2_sort",
+        )
+        s2_sort = _S2_SORT_KEYS[_si2]
  
     filtered2 = []
     for a in s1_included:
@@ -1007,9 +1135,78 @@ def _render_stage2(review_id: int, current_reviewer_id: str, is_arbiter: bool) -
         filtered2.append(a)
  
     filtered2 = _sort_articles(filtered2, s2_sort, my_s2_decisions)
-    st.caption(f"Showing {len(filtered2)} of {total2} articles — "
-               f"{len(ft_pmids)} have full text retrieved")
- 
+    st.caption(
+        f"{t('showing')} {len(filtered2)} {t('of')} {total2} {t('articles')} — "
+        f"{len(ft_pmids)} {t('have_retrieved')}"
+    )
+
+    # ── Bulk actions ───────────────────────────────────────────────────────────
+    _needs_pico = [
+        a for a in s1_included
+        if _get_cached(review_id, a["pmid"], "s1_pico")
+        and not _get_cached(review_id, a["pmid"], "s2_pico")
+        and (ft_map.get(a["pmid"]) or a.get("abstract", "")).strip()
+    ]
+    _needs_sum = [
+        a for a in s1_included
+        if not _get_cached(review_id, a["pmid"], "s2_summary")
+        and (ft_map.get(a["pmid"]) or a.get("abstract", "")).strip()
+    ]
+
+    bb1, bb2 = st.columns(2)
+    with bb1:
+        _pico_lbl = (
+            f"{t('bulk_check_all')} ({len(_needs_pico)} remaining)"
+            if _needs_pico else t("all_checked")
+        )
+        if st.button(_pico_lbl, key=f"s2pico_all_{review_id}",
+                     type="primary", disabled=not _needs_pico):
+            _prog = st.progress(0, text="Starting PICO consistency checks…")
+            _total_p = len(_needs_pico)
+            for _i, _art in enumerate(_needs_pico):
+                _pmid = _art["pmid"]
+                _prog.progress(
+                    _i / _total_p,
+                    text=f"🔍 Checking PICO — {_i + 1} of {_total_p} articles…"
+                )
+                try:
+                    _src = (ft_map.get(_pmid) or _art.get("abstract", ""))
+                    _s2 = extract_pico(_src[:3000])
+                    _set_cached(review_id, _pmid, "s2_pico", _s2)
+                except Exception as _e:
+                    logger.error("Bulk PICO consistency failed pmid=%s: %s",
+                                 _pmid, _e)
+            _prog.progress(1.0,
+                text=f"✅ PICO consistency checked for {_total_p} articles.")
+            st.rerun()
+
+    with bb2:
+        _sum_lbl = (
+            f"{t('bulk_summarise_all')} ({len(_needs_sum)} remaining)"
+            if _needs_sum else t("all_summarised")
+        )
+        if st.button(_sum_lbl, key=f"s2sum_all_{review_id}",
+                     type="primary", disabled=not _needs_sum):
+            _prog2 = st.progress(0, text="Starting summarisation…")
+            _total_s = len(_needs_sum)
+            for _i, _art in enumerate(_needs_sum):
+                _pmid = _art["pmid"]
+                _prog2.progress(
+                    _i / _total_s,
+                    text=f"📝 Summarising — {_i + 1} of {_total_s} articles…"
+                )
+                try:
+                    _text = (ft_map.get(_pmid) or _art.get("abstract", ""))
+                    _res  = summarize_with_llm(_text[:4000])
+                    _set_cached(review_id, _pmid, "s2_summary",
+                                _res or "(no output)")
+                except Exception as _e:
+                    logger.error("Bulk summarise failed pmid=%s: %s", _pmid, _e)
+            _prog2.progress(1.0,
+                text=f"✅ Summarised {_total_s} articles.")
+            st.rerun()
+    # ── End bulk actions ───────────────────────────────────────────────────────
+
     for article in filtered2:
         _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                         ft_map, my_s2_decisions)
@@ -1030,12 +1227,14 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                         "core":"sr-source-core"}.get(source_val,"sr-source-default")
             _src_lbl = {"pubmed":"PubMed","europe_pmc":"Europe PMC","core":"CORE"}.get(
                 source_val, source_val.upper() or "Unknown")
-            ft_badge = ('<span style="font-size:0.7rem;font-weight:600;padding:0.1rem 0.45rem;'
-                        'border-radius:4px;background:#D1FAE5;color:#065F46;margin-right:0.4rem;">'
-                        '📄 Full Text</span>' if has_ft else
-                        '<span style="font-size:0.7rem;font-weight:600;padding:0.1rem 0.45rem;'
-                        'border-radius:4px;background:#FEF3C7;color:#92400E;margin-right:0.4rem;">'
-                        '📋 Abstract only</span>')
+            ft_badge = (
+                f'<span style="font-size:0.7rem;font-weight:600;padding:0.1rem 0.45rem;'
+                f'border-radius:4px;background:#D1FAE5;color:#065F46;margin-right:0.4rem;">'
+                f'{t("ft_badge")}</span>' if has_ft else
+                f'<span style="font-size:0.7rem;font-weight:600;padding:0.1rem 0.45rem;'
+                f'border-radius:4px;background:#FEF3C7;color:#92400E;margin-right:0.4rem;">'
+                f'{t("abstract_only_badge")}</span>'
+            )
             st.markdown(
                 f'{ft_badge}<span style="font-weight:600;font-size:0.9rem;color:#0F172A;">'
                 f'{article["title"]}</span>', unsafe_allow_html=True)
@@ -1059,12 +1258,8 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
         # ── Full text or abstract ──────────────────────────────────────
         # ── PDF upload (manual full text) ─────────────────────────────
         if not has_ft:
-            with st.expander("📤 Upload full text PDF (paywalled papers)",
-                             expanded=False):
-                st.caption(
-                    "Download the PDF through your institution, then upload here. "
-                    "Text will be extracted and stored permanently in the database."
-                )
+            with st.expander(t("upload_pdf_title"), expanded=False):
+                st.caption(t("upload_pdf_desc"))
                 uploaded = st.file_uploader(
                     "Choose PDF", type=["pdf"],
                     key=f"pdf_upload_{pmid}_{review_id}",
@@ -1101,22 +1296,21 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                             has_ft    = True
                             ft_map[pmid] = extracted_text
                             st.success(
-                                f"✅ PDF uploaded — {n_pages} pages, "
-                                f"{len(extracted_text):,} characters extracted and saved."
+                                t("upload_pdf_success").format(
+                                    pages=n_pages,
+                                    chars=f"{len(extracted_text):,}"
+                                )
                             )
                             st.rerun()
                         except Exception as e:
                             st.error(f"Could not save to DB: {e}")
                     else:
-                        st.error(
-                            "Could not extract readable text from this PDF. "
-                            "It may be a scanned image — OCR is not yet supported."
-                        )
+                        st.error(t("upload_pdf_error"))
 
         # ── Full text or abstract ──────────────────────────────────────
         display_text = full_text if has_ft else (article.get("abstract") or "")
-        label = (f"📄 Full Text ({len(full_text):,} chars)"
-                 if has_ft else "📋 Abstract (no full text retrieved)")
+        label = (t("ft_label_chars").format(n=f"{len(full_text):,}")
+                 if has_ft else t("abstract_no_ft"))
         with st.expander(label, expanded=True):
             if has_ft:
                 preview = display_text[:3000]
@@ -1126,10 +1320,8 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                     )
                 st.markdown(preview)
             else:
-                st.write(display_text or "No text available.")
-                st.caption(
-                    "💡 Retrieve via Search → Full Texts, or upload PDF above."
-                )
+                st.write(display_text or t("no_text_available"))
+                st.caption(t("retrieve_hint"))
 
         # ── PICO Consistency Check ─────────────────────────────────────
         s1_pico = _get_cached(review_id, pmid, "s1_pico")
@@ -1144,7 +1336,7 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
             }
             pc1, pc2 = st.columns([1, 4])
             _btn_lbl = (
-                "🔄 Re-check PICO" if s2_pico else "🔍 Check PICO Consistency"
+                t("btn_recheck_pico") if s2_pico else t("btn_check_pico")
             )
             if pc1.button(_btn_lbl, key=f"s2pico_{pmid}",
                           type="secondary"):
@@ -1169,12 +1361,11 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                 with pc2.container():
                     if _cx["consistent"]:
                         st.markdown(
-                            '<div style="background:#D1FAE5;border:1px solid '
-                            '#6EE7B7;border-radius:8px;padding:0.45rem 0.9rem;'
-                            'font-size:0.82rem;">'
-                            '✅ <b>PICO consistent</b> — abstract and '
-                            'full text describe the same study elements.'
-                            '</div>',
+                            f'<div style="background:#D1FAE5;border:1px solid '
+                            f'#6EE7B7;border-radius:8px;padding:0.45rem 0.9rem;'
+                            f'font-size:0.82rem;">'
+                            f'{t("pico_consistent")}'
+                            f'</div>',
                             unsafe_allow_html=True)
                     else:
                         _flagged_names = [
@@ -1182,47 +1373,39 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                             for el, v in _cx["elements"].items()
                             if v["flagged"]
                         ]
-                        _verb = ("differs" if len(_flagged_names) == 1
-                                 else "differ")
+                        _verb = (t("pico_diff_single") if len(_flagged_names) == 1
+                                 else t("pico_diff_multi"))
                         st.markdown(
                             f'<div style="background:#FEF3C7;border:1px solid '
                             f'#FCD34D;border-radius:8px;padding:0.45rem 0.9rem;'
                             f'font-size:0.82rem;">'
-                            f'⚠️ <b>PICO discrepancy</b> — '
-                            f'<b>{", ".join(_flagged_names)}</b> {_verb} '
-                            f'between abstract and full text. '
-                            f'Verify carefully before including.'
+                            f'{t("pico_discrepancy").format(elements=", ".join(_flagged_names), verb=_verb)}'
                             f'</div>',
                             unsafe_allow_html=True)
 
-                with st.expander(
-                    "🔍 PICO comparison (abstract vs full text)",
-                    expanded=_cx["n_flags"] > 0
-                ):
+                with st.expander(t("pico_comparison"), expanded=_cx["n_flags"] > 0):
                     for el, v in _cx["elements"].items():
                         _icon = "⚠️" if v["flagged"] else "✅"
                         _score_pct = round(v["score"] * 100)
                         st.markdown(
                             f'**{_icon} {_PICO_LABELS[el]}** '
                             f'<span style="font-size:0.75rem;color:#6B7280;">'
-                            f'({_score_pct}% overlap)</span>',
+                            f'({_score_pct}% {t("overlap_pct")})</span>',
                             unsafe_allow_html=True)
                         c_s1, c_s2 = st.columns(2)
-                        c_s1.caption("Abstract")
-                        c_s1.markdown(v["s1"] or "*—not extracted—*")
-                        c_s2.caption("Full text")
-                        c_s2.markdown(v["s2"] or "*—not extracted—*")
+                        c_s1.caption(t("abstract_col"))
+                        c_s1.markdown(v["s1"] or t("not_extracted"))
+                        c_s2.caption(t("full_text_col"))
+                        c_s2.markdown(v["s2"] or t("not_extracted"))
                         st.divider()
         elif not s1_pico:
-            st.caption(
-                "💡 Extract PICO in Stage 1 to enable consistency checking here."
-            )
+            st.caption(t("extract_pico_s1_hint"))  
 
         # ── Per-card AI Summariser ─────────────────────────────────────
         cached_sum = _get_cached(review_id, pmid, "s2_summary")
         
         sc1, sc2 = st.columns([1,4])
-        if sc1.button("📝 Summarise", key=f"s2sum_{pmid}", type="secondary"):
+        if sc1.button(t("btn_summarise"), key=f"s2sum_{pmid}", type="secondary"):
             text_to_summarise = (full_text[:4000] if has_ft
                                  else article.get("abstract",""))
             if not text_to_summarise:
@@ -1240,7 +1423,7 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
                 st.markdown(
                     f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
                     f'border-radius:8px;padding:0.7rem 1rem;font-size:0.85rem;">'
-                    f'<b>AI Summary</b><br>{cached_sum}</div>',
+                    f'{t("ai_summary_label")}<br>{cached_sum}</div>',
                     unsafe_allow_html=True)
  
         # ── Reason → Note → Decision → Submit ─────────────────────────
@@ -1255,10 +1438,10 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
             _effective= _pending if _pending is not None else my_decision
  
             if _effective in ("exclude","unsure"):
-                _rmap = FULLTEXT_EXCLUDE_REASONS if _effective=="exclude" else UNSURE_REASONS
-                st.markdown('<div style="font-size:0.72rem;font-weight:600;'
-                    'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.3rem;">'
-                    'Exclusion reason</div>', unsafe_allow_html=True)
+                _rmap = FULLTEXT_EXCLUDE_REASONS() if _effective=="exclude" else UNSURE_REASONS()
+                st.markdown(f'<div style="font-size:0.72rem;font-weight:600;'
+                    f'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.3rem;">'
+                    f'{t("exclusion_reason")}</div>', unsafe_allow_html=True)
                 tcols = st.columns(3)
                 _sel = list(_saved_tags)
                 for i,(lbl,key) in enumerate(_rmap.items()):
@@ -1269,24 +1452,24 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
             else:
                 _sel = list(_saved_tags)
  
-            _note = st.text_input("📝 Note (optional)", value=_saved_note,
+            _note = st.text_input(t("note_optional"), value=_saved_note,
                 key=f"s2note_{pmid}_{current_reviewer_id}",
-                placeholder="Read full text → summarise → note → decide → Submit")
+                placeholder=t("placeholder_s2_note"))
  
-            st.markdown('<div style="font-size:0.72rem;font-weight:600;'
-                'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.25rem;">'
-                'Stage 2 Decision</div>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:0.72rem;font-weight:600;'
+                f'text-transform:uppercase;color:#6B7280;margin:0.5rem 0 0.25rem;">'
+                f'{t("stage2_decision")}</div>', unsafe_allow_html=True)
             b1,b2,b3,bsub = st.columns([2,2,2,3])
  
-            if b1.button("✅ Include", key=f"s2inc_{pmid}_{current_reviewer_id}",
+            if b1.button(t("btn_include"), key=f"s2inc_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="include" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="include" else "include"
                 st.rerun()
-            if b2.button("❌ Exclude", key=f"s2exc_{pmid}_{current_reviewer_id}",
+            if b2.button(t("btn_exclude"), key=f"s2exc_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="exclude" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="exclude" else "exclude"
                 st.rerun()
-            if b3.button("❓ Unsure", key=f"s2uns_{pmid}_{current_reviewer_id}",
+            if b3.button(t("btn_unsure"),  key=f"s2uns_{pmid}_{current_reviewer_id}",
                 type="primary" if _effective=="unsure" else "secondary", use_container_width=True):
                 st.session_state[_pend_key] = None if _pending=="unsure" else "unsure"
                 st.rerun()
@@ -1294,7 +1477,7 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
             _reason_to_save = _build_reason(_sel, _note)
             _can_submit = _effective is not None
             if bsub.button(
-                "💾 Submit" if _pending is not None else "💾 Update",
+                t("btn_submit") if _pending is not None else t("btn_update"),
                 key=f"s2sub_{pmid}_{current_reviewer_id}",
                 type="primary" if _can_submit else "secondary",
                 use_container_width=True, disabled=not _can_submit):
@@ -1316,12 +1499,18 @@ def _render_s2_card(article, review_id, current_reviewer_id, is_arbiter,
 # ══════════════════════════════════════════════════════════════════════════════
 def _render_conflict_tab(review_id: int, current_reviewer_id: str, is_arbiter: bool) -> None:
     if not is_arbiter:
-        st.info("🔒 Conflicts tab is only accessible to the **Editor**.")
+        st.info(t("conflicts_editor_only"))
         return
  
-    stage = st.radio("Stage:", ["Stage 1 — Title/Abstract","Stage 2 — Full Text"],
-                     horizontal=True, key="conflict_stage")
-    stage_key = "title_abstract" if "1" in stage else "full_text"
+    _STAGE_KEYS  = ["title_abstract", "full_text"]
+    _stage_idx = st.radio(
+        t("stage_select"),
+        options=range(2),
+        format_func=lambda i: [t("stage1_tab_abstract"), t("stage2_full_text")][i],
+        horizontal=True, key="conflict_stage",
+    )
+    stage     = ["Stage 1 — Title/Abstract", "Stage 2 — Full Text"][_stage_idx]
+    stage_key = _STAGE_KEYS[_stage_idx]
 
     conflicts = screening_repo.get_conflicts(review_id, stage_key)
 
@@ -1350,7 +1539,7 @@ def _render_conflict_tab(review_id: int, current_reviewer_id: str, is_arbiter: b
                         f"<small>{_reviewer_label(rev_id)}</small><br>"
                         f"<span style='font-size:1.4em'>"
                         f"{DECISION_EMOJI.get(dec,'⬜')}</span><br>"
-                        f"<small><b>{DECISION_LABEL.get(dec,'Pending')}"
+                        f"<small><b>{_dlabel(dec)}"
                         f"</b></small></div>",
                         unsafe_allow_html=True)
                     if row and row.get("reason"):
@@ -1370,9 +1559,9 @@ def _render_conflict_tab(review_id: int, current_reviewer_id: str, is_arbiter: b
                     adj_notes = st.text_area(
                         "Notes:", key=f"adj_notes_{pmid}_{stage_key}",
                         height=80)
-                    _rmap_adj = (FULLTEXT_EXCLUDE_REASONS
+                    _rmap_adj = (FULLTEXT_EXCLUDE_REASONS()
                                  if stage_key == "full_text"
-                                 else EXCLUDE_REASONS)
+                                 else EXCLUDE_REASONS())
                     _adj_opts = ["— (not applicable)"] + list(_rmap_adj.keys())
                     _adj_lbl = st.radio(
                         "Canonical exclusion reason (if excluding):",
@@ -1402,8 +1591,8 @@ def _render_conflict_tab(review_id: int, current_reviewer_id: str, is_arbiter: b
             "both reviewers excluded with different reasons. "
             "Set a canonical reason for the PRISMA breakdown."
         )
-        _rmap_rc = (FULLTEXT_EXCLUDE_REASONS if stage_key == "full_text"
-                    else EXCLUDE_REASONS)
+        _rmap_rc = (FULLTEXT_EXCLUDE_REASONS() if stage_key == "full_text"
+                    else EXCLUDE_REASONS())
         for rc in reason_conflicts:
             pmid_rc  = rc["pmid"]
             title_rc = rc.get("title","")[:80]
@@ -1450,14 +1639,14 @@ def _render_adjudicated_summary(review_id: int, stage: str = "title_abstract") -
 # ══════════════════════════════════════════════════════════════════════════════
 def _render_agreement_stats(review_id: int) -> None:
     stats = screening_repo.get_agreements(review_id, "title_abstract")
-    st.markdown("### Inter-Rater Agreement — Stage 1")
-    st.caption("Required for Methods section reporting in published systematic reviews.")
+    st.markdown(f"### {t('inter_rater')}")
+    st.caption(t("inter_rater_caption"))
  
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Dual-Screened", stats["dual_screened"])
-    c2.metric("Agreements",    stats["agreements"])
-    c3.metric("Conflicts",     stats["conflicts"])
-    c4.metric("Agreement %",   f"{stats['agreement_pct']}%")
+    c1.metric(t("dual_screened"), stats["dual_screened"])
+    c2.metric(t("agreements"),    stats["agreements"])
+    c3.metric(t("conflicts"),     stats["conflicts"])
+    c4.metric(t("agreement_pct"), f"{stats['agreement_pct']}%")
  
     pct = stats["agreement_pct"]
     if stats["dual_screened"] > 0:
@@ -1466,7 +1655,7 @@ def _render_agreement_stats(review_id: int) -> None:
         else:           st.error(f"❌ {pct}% — Poor (<80%). Calibration recommended.")
  
     st.divider()
-    st.markdown("#### Reporting Template")
+    st.markdown(t("reporting_template"))
     adj  = adjudication_repo.count_by_decision(review_id)
     adj_n= sum(adj.values())
     st.code(
@@ -1479,7 +1668,7 @@ def _render_agreement_stats(review_id: int) -> None:
     st.divider()
  
     # ── Per-reviewer aggregate table ──────────────────────────────────
-    st.markdown("#### Per-Reviewer Decision Summary")
+    st.markdown(f"#### {t('per_reviewer')}")
     reviewer_ids = ["rev_reviewer_1","rev_reviewer_2","rev_reviewer_3","rev_editor"]
     articles     = article_repo.get_articles_for_review(review_id)
     agg_rows = []
@@ -1493,18 +1682,18 @@ def _render_agreement_stats(review_id: int) -> None:
             tot = sum(counts_r.values())
             if tot > 0:
                 agg_rows.append({
-                    "Reviewer":   _reviewer_label(rev_id),
-                    "Stage":      stage_label,
-                    "Include 🟢": counts_r["include"],
-                    "Exclude 🔴": counts_r["exclude"],
-                    "Unsure 🟡":  counts_r["unsure"],
-                    "Total":      tot,
-                    "% Decided":  f"{round(100*tot/max(len(articles),1))}%",
+                    t("reviewer_col"):                  _reviewer_label(rev_id),
+                    t("stage_col"):                     stage_label,
+                    f"{t('decision_include')} 🟢":      counts_r["include"],
+                    f"{t('decision_exclude')} 🔴":      counts_r["exclude"],
+                    f"{t('decision_unsure')} 🟡":       counts_r["unsure"],
+                    t("total_col"):                     tot,
+                    t("decided_pct"):                   f"{round(100*tot/max(len(articles),1))}%",
                 })
     if agg_rows:
         st.dataframe(pd.DataFrame(agg_rows), use_container_width=True, hide_index=True)
     else:
-        st.caption("No decisions recorded yet.")
+        st.caption(t("no_decisions_yet"))
  
     st.divider()
  
@@ -1513,17 +1702,16 @@ def _render_agreement_stats(review_id: int) -> None:
     is_arbiter = "editor" in current_reviewer_id.lower()
  
     if not is_arbiter:
-        st.info("🔒 The Detailed Decision Log is only available to the **Editor** "
-                "to protect blinded screening. Switch to Editor role in the sidebar.")
+        st.info(t("log_protected"))
         return
  
-    st.markdown("#### Detailed Decision Log (Editor only)")
+    st.markdown(t("detailed_log"))
     active = [r for r in reviewer_ids if any(
         screening_repo.get_decision(review_id, art["pmid"], "title_abstract", r)
         for art in articles)]
  
     if not active:
-        st.caption("No decisions recorded yet.")
+        st.caption(t("no_decisions_yet"))
         return
  
     rev_sel = st.selectbox("Reviewer:", active, format_func=_reviewer_label,
@@ -1532,7 +1720,7 @@ def _render_agreement_stats(review_id: int) -> None:
                          horizontal=True, key="sum_stage_sel")
     stage_key = "title_abstract" if "1" in stage_sel else "full_text"
  
-    all_reasons = {**EXCLUDE_REASONS, **UNSURE_REASONS, **FULLTEXT_EXCLUDE_REASONS}
+    all_reasons = {**EXCLUDE_REASONS(), **UNSURE_REASONS(), **FULLTEXT_EXCLUDE_REASONS()}
     detail_rows = []
     for art in articles:
         row = screening_repo.get_decision_with_reason(
@@ -1558,7 +1746,8 @@ def _render_agreement_stats(review_id: int) -> None:
         df = pd.DataFrame(detail_rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.download_button(
-            f"📥 Download {_reviewer_label(rev_sel)} — {stage_sel} (CSV)",
+            t("download_csv").format(
+                reviewer=_reviewer_label(rev_sel), stage=stage_sel),
             data=df.to_csv(index=False),
             file_name=f"screening_{rev_sel}_{stage_key}_{review_id}.csv",
             mime="text/csv", use_container_width=True)

@@ -250,6 +250,8 @@ from ui.prisma_panel           import render_prisma_diagram
 from ui.screening_panel        import render_screening_panel
 from ui.ai_analysis_panel      import render_ai_analysis_panel
 from ui.styles                 import inject_styles
+from utils.i18n import t
+from ui.styles import inject_language_styles
 
 init_database()
 run_migrations()
@@ -276,6 +278,7 @@ st.set_page_config(
 )
 
 inject_styles()
+inject_language_styles()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -291,6 +294,54 @@ def _store(rid, key, value):
 def _load(rid, key, default=None):
     return st.session_state.get(_sk(rid, key), default)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LANGUAGE PERSISTENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_language() -> str:
+    """Load persisted language from DB (prisma_settings, review_id=0)."""
+    from storage.database import get_connection
+    import json as _j
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM prisma_settings WHERE review_id = 0"
+            ).fetchone()
+        if row:
+            return _j.loads(row["settings_json"]).get("language", "en")
+    except Exception:
+        pass
+    return "en"
+
+
+def _save_language(lang: str) -> None:
+    """Persist language choice to DB (prisma_settings, review_id=0)."""
+    from storage.database import get_connection
+    import json as _j
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM prisma_settings WHERE review_id = 0"
+            ).fetchone()
+            existing = _j.loads(row["settings_json"]) if row else {}
+            existing["language"] = lang
+            conn.execute("""
+                INSERT INTO prisma_settings (review_id, settings_json, updated_at)
+                VALUES (0, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(review_id) DO UPDATE SET
+                    settings_json = excluded.settings_json,
+                    updated_at    = CURRENT_TIMESTAMP
+            """, (_j.dumps(existing),))
+    except Exception as e:
+        logger.warning("Could not save language: %s", e)
+
+
+# Initialise language from DB on every page load
+if "language" not in st.session_state:
+    st.session_state["language"] = _load_language()
+
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRISMA STATE HELPERS
@@ -302,9 +353,41 @@ def _get_prisma_sources_from_db(review_id: int) -> Dict:
     except Exception as e:
         logger.error("_get_prisma_sources_from_db failed: %s", e)
         return {}
+
+    from storage.database import get_connection
+    import json as _j
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
+                (review_id,)
+            ).fetchone()
+        if row:
+            _ps = _j.loads(row["settings_json"])
+
+            # Override source counts with RAW API counts (before any dedup)
+            for _src in ["PubMed", "Europe PMC", "CORE"]:
+                _raw = _ps.get(f"raw_n_{_src}", 0)
+                if _raw:
+                    source_totals[_src] = _raw
+
+            # Total duplicates = intra-source + cross-source
+            _intra = sum(_ps.get(f"intra_n_{s}", 0)
+                         for s in ["PubMed", "Europe PMC", "CORE"])
+            _cross = int(_ps.get("_duplicates_removed", 0))
+            _total_dupes = _intra + _cross
+            if _total_dupes:
+                source_totals["duplicates_removed"] = _total_dupes
+                _store(review_id, "n_duplicates_removed", _total_dupes)
+
+    except Exception as e:
+        logger.warning("prisma_settings read failed: %s", e)
+
+    # Session state fallback for duplicates
     dupes = _load(review_id, "n_duplicates_removed", 0) or 0
-    if dupes:
+    if dupes and "duplicates_removed" not in source_totals:
         source_totals["duplicates_removed"] = dupes
+
     return source_totals
 
 
@@ -389,7 +472,7 @@ def _title_key(title: str) -> str:
     import re
     t = re.sub(r"[^a-z0-9 ]", "", (title or "").lower())
     t = re.sub(r"\s+", " ", t).strip()
-    return t[:60]
+    return t
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -404,8 +487,9 @@ def _deduplicate(*lists) -> tuple:
     seen_pmid:  Dict[str, object] = {}
     seen_doi:   Dict[str, object] = {}
     seen_title: Dict[str, object] = {}
-    unique: list = []
-    dupes = 0
+    unique:    list = []
+    dupes:     int  = 0
+    dupe_list: list = []
 
     for art_list in lists:
         for art in (art_list or []):
@@ -415,21 +499,53 @@ def _deduplicate(*lists) -> tuple:
                 doi = pmid
             title = _title_key(_af(art, "title") or "")
 
+            # Title similarity — require high word overlap AND similar length.
+            # Prevents subset titles (e.g. short title vs long title) being
+            # flagged as duplicates.
+            _title_dupe = False
+            if title:
+                for _seen_t in seen_title:
+                    _len_ratio = (min(len(title), len(_seen_t)) /
+                                  max(len(title), len(_seen_t), 1))
+                    if _len_ratio < 0.75:
+                        continue          # one title much shorter → not a dupe
+                    _w1 = set(title.split())
+                    _w2 = set(_seen_t.split())
+                    _jaccard = len(_w1 & _w2) / max(len(_w1 | _w2), 1)
+                    if _jaccard >= 0.85:
+                        _title_dupe = True
+                        break
+
             is_dupe = (
-                (pmid  and pmid  in seen_pmid)  or
-                (doi   and doi   in seen_doi)   or
-                (title and title in seen_title)
+                (pmid  and pmid in seen_pmid) or
+                (doi   and doi  in seen_doi)  or
+                _title_dupe
             )
 
             if is_dupe:
                 dupes += 1
+                _reason = (
+                    f"Same PMID: {pmid}"  if pmid  and pmid  in seen_pmid else
+                    f"Same DOI: {doi}"    if doi   and doi   in seen_doi  else
+                    "Same title"
+                )
+                _entry = (dict(art) if isinstance(art, dict)
+                          else {"pmid": pmid,
+                                "title":   _af(art, "title",   ""),
+                                "source":  _af(art, "source",  ""),
+                                "year":    _af(art, "year",    ""),
+                                "journal": _af(art, "journal", ""),
+                                "abstract":_af(art, "abstract",""),
+                                "doi":     doi})
+                _entry["_dupe_reason"] = _reason
+                dupe_list.append(_entry)
             else:
                 unique.append(art)
                 if pmid:  seen_pmid[pmid]   = art
                 if doi:   seen_doi[doi]     = art
                 if title: seen_title[title] = art
 
-    return unique, dupes
+    return unique, dupes, dupe_list
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -628,7 +744,7 @@ def _render_unified_fulltext_tab(review_id: int, pmc_cl, article_repo):
         st.info("Search for articles first, then use this tab to find full texts.")
         return
 
-    all_unique, _ = _deduplicate(pubmed_arts, epmc_arts, core_arts)
+    all_unique, _, _ = _deduplicate(pubmed_arts, epmc_arts, core_arts)
     n_total = len(all_unique)
 
     pmid_articles  = [a for a in all_unique
@@ -1055,6 +1171,129 @@ def _run_unified_fulltext(review_id, pmid_articles, epmc_articles_, pmc_cl, arti
         )
     st.rerun()
 
+def _compute_cross_source_dupes(review_id, article_repo):
+    from storage.database import get_connection
+    import json as _j
+
+    _pub = _load(review_id, "articles_PubMed",     []) or []
+    _epm = _load(review_id, "articles_Europe PMC", []) or []
+    _cor = _load(review_id, "articles_CORE",       []) or []
+
+    # Distinguish fresh API results (Article dataclasses) from
+    # DB-restored articles (plain dicts). Only dataclasses have
+    # the full cross-source overlap — DB articles are already deduped.
+    _sample       = next(iter(_pub or _epm or _cor or []), None)
+    _is_fresh_api = _sample is not None and not isinstance(_sample, dict)
+
+    if _is_fresh_api:
+        # Fresh API data — compute correctly and persist for refresh
+        _, n_dupes, dupe_list = _deduplicate(_pub, _epm, _cor)
+        _safe = []
+        for d in dupe_list:
+            if not isinstance(d, dict):
+                continue
+            _safe.append({k: str(d.get(k) or "") for k in (
+                "pmid", "title", "source", "year",
+                "journal", "doi", "abstract", "_dupe_reason"
+            )})
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
+                    (review_id,)
+                ).fetchone()
+                existing = _j.loads(row["settings_json"]) if row else {}
+                existing["_duplicates_removed"] = n_dupes
+                existing["_dupe_list"]          = _safe
+                # Persist raw and intra counts for PRISMA accuracy
+                for _src in ["PubMed", "Europe PMC", "CORE"]:
+                    _rn = _load(review_id, f"raw_n_{_src}",   0) or 0
+                    _in = _load(review_id, f"intra_n_{_src}", 0) or 0
+                    existing[f"raw_n_{_src}"]   = _rn
+                    existing[f"intra_n_{_src}"] = _in
+                conn.execute("""
+                    INSERT INTO prisma_settings (review_id, settings_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(review_id) DO UPDATE SET
+                        settings_json = excluded.settings_json,
+                        updated_at    = CURRENT_TIMESTAMP
+                """, (review_id, _j.dumps(existing)))
+        except Exception as _e:
+            logger.warning("Could not save cross-source dupes: %s", _e)
+        return n_dupes, dupe_list
+
+    # DB-restored dicts or no articles — load persisted value from DB
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
+                (review_id,)
+            ).fetchone()
+        if row:
+            _s = _j.loads(row["settings_json"])
+            return int(_s.get("_duplicates_removed", 0)), _s.get("_dupe_list", [])
+    except Exception as _e:
+        logger.warning("Could not load cross-source dupes: %s", _e)
+
+    return 0, []
+
+def _render_duplicate_cards(dupe_list: list) -> None:
+    """Render articles that were removed during cross-source deduplication."""
+    if not dupe_list:
+        st.success("✅ No duplicates were found across your search sources.")
+        return
+
+    st.caption(
+        f"**{len(dupe_list)}** article(s) appeared in more than one source "
+        "and were removed. The first occurrence was kept; duplicates are shown here "
+        "for transparency."
+    )
+
+    _SRC_COLORS = {
+        "pubmed":     ("#DBEAFE", "#1E40AF", "PubMed"),
+        "europe_pmc": ("#DCFCE7", "#166534", "Europe PMC"),
+        "core":       ("#FEF9C3", "#713F12", "CORE"),
+    }
+
+    for d in dupe_list:
+        src_val = str(_af(d, "source", "") or "").lower()
+        bg, fg, src_lbl = _SRC_COLORS.get(src_val, ("#F1F5F9", "#374151", src_val.upper() or "Unknown"))
+        title   = _af(d, "title",   "") or "Untitled"
+        year    = _af(d, "year",    "") or ""
+        journal = _af(d, "journal", "") or ""
+        pmid    = _af(d, "pmid",    "") or ""
+        reason  = d.get("_dupe_reason", "Duplicate detected")
+
+        st.markdown(
+            f'<div style="border:1px solid #E2E8F0;border-left:4px solid {fg};'
+            f'border-radius:8px;padding:0.7rem 1rem;margin-bottom:0.5rem;'
+            f'background:#FAFAFA;">'
+            f'<div style="display:flex;align-items:center;gap:0.5rem;'
+            f'margin-bottom:0.3rem;flex-wrap:wrap;">'
+            f'<span style="background:{bg};color:{fg};border-radius:4px;'
+            f'padding:1px 7px;font-size:0.72rem;font-weight:700;">{src_lbl}</span>'
+            f'<span style="background:#FFE4E6;color:#9F1239;border-radius:4px;'
+            f'padding:1px 7px;font-size:0.72rem;font-weight:600;">🔴 {reason}</span>'
+            f'</div>'
+            f'<div style="font-weight:600;font-size:0.88rem;color:#0F172A;">'
+            f'{title}</div>'
+            f'<div style="font-size:0.75rem;color:#6B7280;margin-top:0.2rem;">'
+            f'{journal}{"  ·  " if journal and year else ""}{year}'
+            f'{"  ·  PMID: " + pmid if pmid else ""}</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+        abstract = _af(d, "abstract", "") or ""
+        if abstract:
+            with st.expander("Abstract", expanded=False):
+                st.write(abstract)
+
+    st.divider()
+    st.caption(
+        "💡 These articles are excluded from screening to avoid double-counting. "
+        "They are included in your PRISMA duplicate count."
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MEDICAL SEARCH FORM
@@ -1063,7 +1302,7 @@ def _run_unified_fulltext(review_id, pmid_articles, epmc_articles_, pmc_cl, arti
 def _render_pubmed_form(review_id, registry, search_repo, article_repo):
     from core.query_builder import STUDY_TYPE_FILTERS
 
-    st.markdown("#### PICO Query Builder — Medical Research")
+    st.markdown(f"#### {t('pico_builder')}")
 
     clients   = registry.get_clients(ResearchDomain.MEDICAL)
     pubmed_cl = next((c for c in clients if c.source_name == "PubMed"), None)
@@ -1077,7 +1316,7 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
     _src_key_ss  = f"medical_source_{review_id}"
     _src_default = st.session_state.get(_src_key_ss, _core_options[0])
     _src_idx     = _core_options.index(_src_default) if _src_default in _core_options else 0
-    source_name  = st.selectbox("Data Source", options=_core_options,
+    source_name  = st.selectbox(t("data_source"), options=_core_options,
                                 index=_src_idx,
                                 key=f"medical_source_select_{review_id}")
     st.session_state[_src_key_ss] = source_name
@@ -1097,32 +1336,32 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
     _st_keys = list(STUDY_TYPE_FILTERS.keys())
 
     with st.form("pico_form"):
-        population   = st.text_input("Population",
+        population   = st.text_input(t("Population"),
                            value=_saved.get("population", ""),
                            placeholder="e.g. adults with CLL")
-        intervention = st.text_input("Intervention",
+        intervention = st.text_input(t("Intervention"),
                            value=_saved.get("intervention", ""),
                            placeholder="e.g. venetoclax")
-        comparison   = st.text_input("Comparison (optional)",
+        comparison   = st.text_input(t("Comparison (optional)"),
                            value=_saved.get("comparison", ""),
                            placeholder="e.g. ibrutinib")
-        outcome      = st.text_input("Outcome",
+        outcome      = st.text_input(t("Outcome"),
                            value=_saved.get("outcome", ""),
                            placeholder="e.g. overall survival")
         col1, col2, col3 = st.columns(3)
-        year_from    = col1.number_input("Year From", 1900, 2100,
+        year_from    = col1.number_input(t("year_from"), 1900, 2100,
                            _saved.get("year_from", 2015))
-        year_to      = col2.number_input("Year To",   1900, 2100,
+        year_to      = col2.number_input(t("year_to"), 1900, 2100,
                            _saved.get("year_to", 2025))
-        max_results  = col3.slider("Max Results", 1, 200,
+        max_results  = col3.slider(t("max_results"), 1, 200,
                            _saved.get("max_results", 20))
         _st_saved_idx = _st_keys.index(_saved["study_type"]) \
                         if _saved.get("study_type") in _st_keys else 0
-        study_type   = st.radio("Study Type Filter",
+        study_type   = st.radio(t("study_type"),
                            options=_st_keys,
                            index=_st_saved_idx,
                            horizontal=True)
-        submitted    = st.form_submit_button(f"🔍 Search {source_name}", type="primary")
+        submitted    = st.form_submit_button(f"{t('btn_search_source')} {source_name}", type="primary")
 
     pending_key = f"pico_pending_{review_id}"
     pending     = st.session_state.get(pending_key, {})
@@ -1205,7 +1444,8 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
             )
         return
 
-    sort_by = st.selectbox("Sort results by", ["Newest first","Oldest first","Most cited"],
+    sort_by = st.selectbox(t("sort_results_by"),
+                           [t("sort_newest"), t("sort_oldest"), t("sort_cited")],
                            key=f"sort_medical_{review_id}")
 
     n_searched = sum(1 for x in [pubmed_articles, epmc_articles, core_articles] if x)
@@ -1226,12 +1466,18 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
             n = src_totals.get(src_name, 0)
             if n > 0:
                 parts.append(f"{src_name}: **{n}**")
-        parts.append(f"Duplicates removed: **{n_dupes_db}**")
+        _n_cross_dupes, _ = _compute_cross_source_dupes(review_id, article_repo)
+        _store(review_id, "n_duplicates_removed", _n_cross_dupes)
+        parts.append(f"Duplicates removed: **{_n_cross_dupes}**")
         parts.append(f"Unique in DB: **{db_total}**")
         st.info("📊 **Multi-source:** " + " | ".join(parts))
 
     # Use DB counts for tab labels so they match the banner and PRISMA
     _src_totals_tabs = search_repo.get_source_totals(review_id)
+
+    # Compute duplicates across all sources for the new tab
+    _n_dupes_tab, _dupe_list = _compute_cross_source_dupes(review_id, article_repo)
+
     tab_labels = []
     tab_data   = []
     if pubmed_articles:
@@ -1246,7 +1492,8 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
         _n = _src_totals_tabs.get("CORE", len(core_articles))
         tab_labels.append(f"🟠 CORE ({_n})")
         tab_data.append(core_articles)
-    tab_labels.append("📄 Full Texts")
+    tab_labels.append(t("tab_full_texts"))
+    tab_labels.append(f"{t('tab_duplicates')} ({_n_dupes_tab})")
 
     tabs_out     = st.tabs(tab_labels)
     _tab_sources = []
@@ -1260,12 +1507,16 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
             _q  = _load(review_id, f"query_{src}")
             _ql = _load(review_id, f"query_label_{src}", "Query")
             if _q:
-                with st.expander(f"🔍 {_ql} — click to view / copy full query", expanded=False):
+                with st.expander(f"🔍 {_ql} — click to view / copy full query",
+                                 expanded=False):
                     st.code(_q, language="text")
             _render_article_cards(articles_list, pmc_urls={}, sort_by=sort_by)
 
-    with tabs_out[-1]:
+    with tabs_out[-2]:          # Full Texts — now second-to-last
         _render_unified_fulltext_tab(review_id, pmc_cl, article_repo)
+
+    with tabs_out[-1]:          # Duplicates Removed — always last
+        _render_duplicate_cards(_dupe_list)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1323,7 +1574,11 @@ def _do_search(review_id, source_name, population, intervention,
         client = pubmed_cl if source_name == "PubMed" else epmc_cl
 
         with st.spinner(f"Searching {source_name}…"):
-            articles  = client.search_and_fetch(query, max_results)
+            articles    = client.search_and_fetch(query, max_results)
+            _raw_n      = len(articles)
+            articles, _intra_n, _ = _deduplicate(articles)
+            _store(review_id, f"raw_n_{source_name}",   _raw_n)
+            _store(review_id, f"intra_n_{source_name}", _intra_n)
             search_id = search_repo.create_search(review_id=review_id, query=query,
                                                   n_results=len(articles), source_name=source_name)
             result    = article_repo.save_articles(articles, review_id, search_id)
@@ -1512,40 +1767,23 @@ def _do_core_search(review_id, population, intervention, comparison,
         st.warning("CORE returned results but none could be parsed.")
         return
 
+    # Deduplicate within CORE results — same paper can appear with different CORE IDs
+    _raw_n_core    = len(articles)
+    articles, _intra_n_core, _ = _deduplicate(articles)
+    _store(review_id, "raw_n_CORE",   _raw_n_core)
+    _store(review_id, "intra_n_CORE", _intra_n_core)
+
     search_id = search_repo.create_search(review_id=review_id, query=query,
                                           n_results=len(articles), source_name="CORE")
     result    = article_repo.save_articles(articles, review_id, search_id)
 
-    # Auto-download and parse open-access CORE PDFs in background
-    if _core_pdf_urls:
-        _parsed_count = 0
-        _prog = st.progress(0, text="Parsing open-access CORE PDFs…")
-        _total_pdfs = len(_core_pdf_urls)
-        from models.schemas import Article as _A, ArticleSource as _AS, ResearchDomain as _RD
-        _ft_arts = []
-        for _i, (_uid, _purl) in enumerate(_core_pdf_urls.items()):
-            _prog.progress((_i+1)/_total_pdfs,
-                           text=f"Parsing PDF {_i+1}/{_total_pdfs}…")
-            _text = _fetch_and_parse_pdf(_purl)
-            if _text:
-                try:
-                    _ft_arts.append(_A(
-                        pmid=_uid, title="", abstract="", authors=[],
-                        journal="", year="", doi=None, url="",
-                        source=_AS("core"), domain=_RD.MEDICAL,
-                        full_text=_text,
-                    ))
-                    _parsed_count += 1
-                except Exception:
-                    pass
-        _prog.empty()
-        if _ft_arts:
-            article_repo.save_full_texts(_ft_arts)
-            st.info(f"📄 **{_parsed_count}** CORE PDFs parsed and stored.")
+    # Store CORE PDF URLs in session state for the Full Texts pipeline
+    _store(review_id, "core_pdf_urls", _core_pdf_urls)
 
     st.success(f"✅ **{len(articles)}** CORE articles found | "
                f"{result['saved']} new | {result['duplicates']} already in DB"
-               + (f" | 📄 {_parsed_count} PDFs parsed" if _core_pdf_urls else ""))
+               + (f" | 📄 {len(_core_pdf_urls)} PDFs available via Full Texts tab"
+                  if _core_pdf_urls else ""))
 
     _store(review_id, "articles_CORE", articles)
     _store(review_id, "search_id_CORE", search_id)
@@ -1657,16 +1895,47 @@ with st.sidebar:
         </div>
     </div>""", unsafe_allow_html=True)
 
-    st.markdown("""<div style="padding:0 1rem 0.35rem;font-size:0.68rem;font-weight:600;
-        color:rgba(255,255,255,0.35);text-transform:uppercase;
-        letter-spacing:0.09em;">Active Review</div>""", unsafe_allow_html=True)
+    # ── Language toggle ───────────────────────────────────────────────
+    _lang_now = st.session_state.get("language", "en")
+    _lang_sel = st.radio(
+        "🌐",
+        options=["English", "繁體中文"],
+        index=0 if _lang_now == "en" else 1,
+        horizontal=True,
+        key="lang_radio",
+        label_visibility="collapsed",
+    )
+    _lang_new = "en" if _lang_sel == "English" else "zh"
+    if _lang_new != _lang_now:
+        # Lock current review selection before rerun so it survives
+        st.session_state["_lang_review_lock"] = st.session_state.get(
+            "review_select_main"
+        )
+        st.session_state["language"] = _lang_new
+        _save_language(_lang_new)
+        st.rerun()
+
+    st.divider()
+
+    st.markdown(f"""<div style="padding:0 1rem 0.35rem;font-size:0.68rem;font-weight:600;
+        color:#000000;text-transform:uppercase;
+        letter-spacing:0.09em;">{t("active_review")}</div>""", unsafe_allow_html=True)
 
     reviews = review_repo.list_reviews()
     if reviews:
-        options   = {r["title"]: r["id"] for r in reviews}
-        selected  = st.selectbox("", list(options.keys()),
-                                  key="review_select_main", label_visibility="collapsed")
+        options  = {r["title"]: r["id"] for r in reviews}
+        _titles  = list(options.keys())
+
+        # Restore review locked before language rerun
+        _lock = st.session_state.pop("_lang_review_lock", None)
+        if _lock and _lock in _titles:
+            st.session_state["review_select_main"] = _lock
+
+        selected  = st.selectbox("", _titles,
+                                  key="review_select_main",
+                                  label_visibility="collapsed")
         review_id = options[selected]
+
     else:
         review_id = None
         st.markdown("""<div style="margin:0 1rem;padding:0.65rem 0.75rem;
@@ -1674,10 +1943,11 @@ with st.sidebar:
             border-radius:8px;font-size:0.8rem;color:rgba(255,255,255,0.35);
             text-align:center;">No reviews yet</div>""", unsafe_allow_html=True)
 
-    with st.expander("＋  New Review", expanded=False):
-        new_title = st.text_input("Title", placeholder="e.g. Venetoclax in CLL",
+    with st.expander(f"＋  {t('new_review')}", expanded=False):
+        new_title = st.text_input("Title",
+                                   placeholder=t("review_title_placeholder"),
                                    key="new_review_title_input", label_visibility="collapsed")
-        if st.button("Create", type="primary", use_container_width=True, key="create_review_btn"):
+        if st.button(t("btn_create"), type="primary", use_container_width=True, key="create_review_btn"):
             if new_title.strip():
                 review_id = review_repo.create_review(new_title.strip())
                 st.success("Created.")
@@ -1687,18 +1957,32 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown("""<div style="padding:0 1rem 0.35rem;font-size:0.68rem;font-weight:600;
-        color:rgba(255,255,255,0.35);text-transform:uppercase;
-        letter-spacing:0.09em;">Identity</div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div style="padding:0 1rem 0.35rem;font-size:0.68rem;font-weight:600;
+        color:#000000;text-transform:uppercase;
+        letter-spacing:0.09em;">{t("identity")}</div>""", unsafe_allow_html=True)
 
-    _ROLES = ["Reviewer 1","Reviewer 2","Reviewer 3","Editor"]
-    selected_reviewer    = st.selectbox("", _ROLES, index=0,
-                                         key="current_reviewer_select", label_visibility="collapsed")
-    current_reviewer_id  = f"rev_{selected_reviewer.lower().replace(' ','_')}"
+    _ROLE_IDS    = ["rev_reviewer_1", "rev_reviewer_2", "rev_reviewer_3", "rev_editor"]
+    _ROLE_LABELS = [t("reviewer_1"), t("reviewer_2"), t("reviewer_3"), t("editor")]
+
+    # Only fix session state when invalid (stale string or out of range).
+    # Never override a valid integer — that would undo the user's selection.
+    _cur = st.session_state.get("current_reviewer_select_idx", 0)
+    if not isinstance(_cur, int) or not (0 <= _cur < len(_ROLE_IDS)):
+        st.session_state["current_reviewer_select_idx"] = 0
+
+    _role_idx = st.selectbox(
+        "", options=range(len(_ROLE_LABELS)),
+        format_func=lambda i: _ROLE_LABELS[i],
+        key="current_reviewer_select_idx",
+        label_visibility="collapsed",
+    )
+    selected_reviewer   = _ROLE_LABELS[_role_idx]
+    current_reviewer_id = _ROLE_IDS[_role_idx]
+
     st.session_state["current_reviewer_id"] = current_reviewer_id
     _is_editor   = "editor" in current_reviewer_id
     _role_color  = "#C9974C" if _is_editor else "rgba(255,255,255,0.4)"
-    _role_desc   = "Unblinded · resolves conflicts" if _is_editor else "Blinded · own decisions only"
+    _role_desc   = t("role_editor_desc") if _is_editor else t("role_reviewer_desc")
 
     st.markdown(f"""<div style="margin:0.4rem 0;padding:0.6rem 0.75rem;
         background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
@@ -1710,11 +1994,7 @@ with st.sidebar:
     </div>""", unsafe_allow_html=True)
 
     st.markdown("""<div style="height:2rem"></div>""", unsafe_allow_html=True)
-    st.markdown("""<div style="position:absolute;bottom:1rem;left:0;right:0;
-        padding:0.75rem 1rem 0;border-top:1px solid rgba(255,255,255,0.07);">
-        <div style="font-size:0.68rem;color:rgba(255,255,255,0.2);text-align:center;">
-            SR/MA · AI-Assisted Platform</div>
-    </div>""", unsafe_allow_html=True)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1774,70 +2054,96 @@ st.markdown(f"""
     <h1 style="margin:0!important;font-size:1.6rem!important;font-weight:600!important;
                letter-spacing:-0.03em!important;color:#1A1A19!important;">
         {review['title']}</h1>
-    <div style="font-size:0.78rem;color:#9B9B9A;margin-top:0.2rem;">
-        Systematic Review &nbsp;·&nbsp; AI-Assisted &nbsp;·&nbsp;
-        <span style="color:#C9974C;">{counts['total']} articles</span>
-        &nbsp;·&nbsp;
-        <span style="color:#059669;">S2: {s2_counts.get('s2_included',0)} included</span>
-    </div>
 </div>""", unsafe_allow_html=True)
 
 # ── Stage 1 metrics row ───────────────────────────────────────────────────────
-st.markdown('<div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;'
-            'letter-spacing:0.08em;color:#6B7280;margin-bottom:0.3rem;">'
-            '📋 Stage 1 — Title/Abstract Screening</div>', unsafe_allow_html=True)
-s1c1,s1c2,s1c3,s1c4,s1c5,s1c6 = st.columns(6)
-s1_metrics = [
-    ("Total Articles",  counts["total"],           "📄"),
-    ("Included",        counts["included"],         "✅"),
-    ("Excluded",        counts["excluded"],         "❌"),
-    ("Unsure",          counts["unsure"],           "❓"),
-    ("Conflicts",       counts.get("conflict",0),  "⚡"),
-    ("Pending",         counts["pending"],          "◷"),
+_s1_done    = counts["included"] + counts["excluded"] + counts["unsure"]
+_s1_pct_val = int(100 * _s1_done / counts["total"]) if counts.get("total", 0) > 0 else 0
+_s1_m       = [
+    ("📄", t("total_articles"), counts["total"]),
+    ("✅", t("included"),       counts["included"]),
+    ("❌", t("excluded"),       counts["excluded"]),
+    ("❓", t("unsure"),         counts["unsure"]),
+    ("⚡", t("conflicts"),      counts.get("conflict", 0)),
+    ("◷",  t("pending"),        counts["pending"]),
 ]
-for col,(label,val,icon) in zip([s1c1,s1c2,s1c3,s1c4,s1c5,s1c6], s1_metrics):
-    col.metric(f"{icon} {label}", val)
-
-# S1 progress bar
-_s1_done = counts["included"] + counts["excluded"] + counts["unsure"]
-if counts["total"] > 0:
-    st.progress(_s1_done / counts["total"],
-                text=f"Stage 1: {_s1_done}/{counts['total']} screened")
+_s1_cells = "".join(
+    f'<div style="flex:1;min-width:80px;text-align:center;padding:0.35rem 0.1rem;">'
+    f'<div style="font-size:1.7rem;font-weight:700;color:#0A1428;line-height:1.1;">{v}</div>'
+    f'<div style="font-size:1.2rem;color:#6B7280;margin-top:0.2rem;">{e} {l}</div></div>'
+    for e, l, v in _s1_m
+)
+st.markdown(f"""
+<div style="background:#F0FFFA;border:1px solid #BBEDE4;border-left:4px solid #00C4A8;
+            border-radius:12px;padding:1rem 1.2rem 0.85rem;margin-bottom:0.6rem;
+            box-shadow:0 2px 10px -3px rgba(0,196,168,0.13);">
+  <div style="font-size:1.2rem;font-weight:700;text-transform:uppercase;
+              letter-spacing:0.09em;color:#007A6A;margin-bottom:0.75rem;">
+    📋 {t("stage1_title")}
+  </div>
+  <div style="display:flex;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+    {_s1_cells}
+  </div>
+  <div style="background:rgba(0,196,168,0.13);border-radius:99px;height:5px;">
+    <div style="background:#00C4A8;width:{_s1_pct_val}%;height:5px;border-radius:99px;
+                min-width:{'3px' if _s1_pct_val > 0 else '0'};"></div>
+  </div>
+  <div style="font-size:1.2rem;color:#6B7280;margin-top:0.3rem;">
+    {_s1_done} / {counts["total"]} {t("screened")} &nbsp;·&nbsp; {_s1_pct_val}%
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Stage 2 metrics row ───────────────────────────────────────────────────────
-st.markdown('<div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;'
-            'letter-spacing:0.08em;color:#6B7280;margin:0.75rem 0 0.3rem;">'
-            '📄 Stage 2 — Full-text Screening</div>', unsafe_allow_html=True)
-s2c1,s2c2,s2c3,s2c4,s2c5,s2c6 = st.columns(6)
 _s2_total    = counts["included"]
 _s2_inc      = s2_counts.get("s2_included", 0)
 _s2_exc      = s2_counts.get("s2_excluded", 0)
 _s2_uns      = s2_counts.get("s2_unsure",   0)
 _s2_conflict = len(screen_repo.get_conflicts(review_id, "full_text"))
 _s2_pending  = max(_s2_total - _s2_inc - _s2_exc - _s2_uns, 0)
-s2_metrics   = [
-    ("Eligible (from S1)", _s2_total,    "📥"),
-    ("Included",           _s2_inc,      "✅"),
-    ("Excluded",           _s2_exc,      "❌"),
-    ("Unsure",             _s2_uns,      "❓"),
-    ("Conflicts",          _s2_conflict, "⚡"),
-    ("Pending",            _s2_pending,  "◷"),
+_s2_done     = _s2_inc + _s2_exc + _s2_uns
+_s2_pct_val  = min(int(100 * _s2_done / _s2_total), 100) if _s2_total > 0 else 0
+_s2_m        = [
+    ("📥", t("eligible_s1"), _s2_total),
+    ("✅", t("included"),    _s2_inc),
+    ("❌", t("excluded"),    _s2_exc),
+    ("❓", t("unsure"),      _s2_uns),
+    ("⚡", t("conflicts"),   _s2_conflict),
+    ("◷",  t("pending"),     _s2_pending),
 ]
-for col,(label,val,icon) in zip([s2c1,s2c2,s2c3,s2c4,s2c5,s2c6], s2_metrics):
-    col.metric(f"{icon} {label}", val)
-
-if _s2_total > 0:
-    _s2_done = _s2_inc + _s2_exc + _s2_uns
-    _s2_progress = min(_s2_done / _s2_total, 1.0)   # cap at 1.0
-    st.progress(_s2_progress,
-                text=f"Stage 2: {min(_s2_done, _s2_total)}/{_s2_total} screened")
+_s2_cells = "".join(
+    f'<div style="flex:1;min-width:80px;text-align:center;padding:0.35rem 0.1rem;">'
+    f'<div style="font-size:1.7rem;font-weight:700;color:#0A1428;line-height:1.1;">{v}</div>'
+    f'<div style="font-size:1.2rem;color:#6B7280;margin-top:0.2rem;">{e} {l}</div></div>'
+    for e, l, v in _s2_m
+)
+st.markdown(f"""
+<div style="background:#FDFAF0;border:1px solid #EFE0A0;border-left:4px solid #E8C45A;
+            border-radius:12px;padding:1rem 1.2rem 0.85rem;margin-bottom:0.6rem;
+            box-shadow:0 2px 10px -3px rgba(232,196,90,0.18);">
+  <div style="font-size:1.2rem;font-weight:700;text-transform:uppercase;
+              letter-spacing:0.09em;color:#7A5C0A;margin-bottom:0.75rem;">
+    📄 {t("stage2_title")}
+  </div>
+  <div style="display:flex;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.75rem;">
+    {_s2_cells}
+  </div>
+  <div style="background:rgba(232,196,90,0.15);border-radius:99px;height:5px;">
+    <div style="background:#E8C45A;width:{_s2_pct_val}%;height:5px;border-radius:99px;
+                min-width:{'3px' if _s2_pct_val > 0 else '0'};"></div>
+  </div>
+  <div style="font-size:1.2rem;color:#6B7280;margin-top:0.3rem;">
+    {min(_s2_done, _s2_total)} / {_s2_total} {t("screened")} &nbsp;·&nbsp; {_s2_pct_val}%
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 _NAV_STEPS = [
-    ("🔍", "Search",      "Step 1: Find literature"),
-    ("📋", "Screening",   "Step 2: Screen articles"),
-    ("✦",  "AI Analysis", "Step 3: Analyse evidence"),
-    ("⬡",  "PRISMA",      "Step 4: Generate diagram"),
+    ("🔍", "Search",      t("step1_hint")),
+    ("📋", "Screening",   t("step2_hint")),
+    ("✦",  "AI Analysis", t("step3_hint")),
+    ("⬡",  "PRISMA",      t("step4_hint")),
 ]
 
 if "active_page" not in st.session_state:
@@ -1845,9 +2151,9 @@ if "active_page" not in st.session_state:
 
 with st.sidebar:
     st.divider()
-    st.markdown('<div style="padding:0 1rem 0.5rem;font-size:0.68rem;font-weight:700;'
-                'color:rgba(255,255,255,0.35);text-transform:uppercase;'
-                'letter-spacing:0.09em;">Workflow</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="padding:0 1rem 0.5rem;font-size:0.68rem;font-weight:700;'
+                f'color:rgba(255,255,255,0.35);text-transform:uppercase;'
+                f'letter-spacing:0.09em;">{t("workflow")}</div>', unsafe_allow_html=True)
 
     for i, (icon, page, hint) in enumerate(_NAV_STEPS, 1):
         is_active = st.session_state["active_page"] == page
@@ -1859,8 +2165,9 @@ with st.sidebar:
             f'<div style="margin:0.15rem 0.75rem;border-radius:8px;'
             f'background:{_bg};border:1px solid {_border};">',
             unsafe_allow_html=True)
+        _page_label = t(f"nav_{page.lower().replace(' ','_')}")
         if st.button(
-            f"{icon}  {page}",
+            f"{icon}  {_page_label}",
             key=f"nav_{page}",
             use_container_width=True,
             type="secondary",
@@ -1880,14 +2187,14 @@ with st.sidebar:
     <div style="padding:0 1rem;">
         <div style="font-size:0.68rem;font-weight:700;color:rgba(255,255,255,0.35);
                     text-transform:uppercase;letter-spacing:0.09em;margin-bottom:0.5rem;">
-            Progress</div>
+            {t("progress_label")}</div>
         <div style="font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.2rem;">
-            Stage 1: {_s1_pct}%</div>
+            {t("progress_stage1")} {_s1_pct}%</div>
         <div style="background:rgba(255,255,255,0.1);border-radius:99px;height:4px;margin-bottom:0.6rem;">
             <div style="background:#C9974C;width:{_s1_pct}%;height:4px;border-radius:99px;"></div>
         </div>
         <div style="font-size:0.75rem;color:rgba(255,255,255,0.5);margin-bottom:0.2rem;">
-            Stage 2: {_s2_pct}%</div>
+            {t("progress_stage2")} {_s2_pct}%</div>
         <div style="background:rgba(255,255,255,0.1);border-radius:99px;height:4px;">
             <div style="background:#059669;width:{_s2_pct}%;height:4px;border-radius:99px;"></div>
         </div>
@@ -1899,7 +2206,7 @@ _active = st.session_state["active_page"]
 # ── Content area ──────────────────────────────────────────────────────────────
 if _active == "Search":
     domain_options = registry.domain_display_names()
-    domain_choice  = st.selectbox("Research Domain", options=list(domain_options.keys()),
+    domain_choice  = st.selectbox(t("research_domain"), options=list(domain_options.keys()),
                                   format_func=lambda k: domain_options[k], key="domain_select")
     selected_domain = ResearchDomain(domain_choice)
     if selected_domain == ResearchDomain.MEDICAL:

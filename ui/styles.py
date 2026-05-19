@@ -6,7 +6,68 @@ import streamlit as st
 def inject_styles() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
+def inject_language_styles() -> None:
+    """Inject language-specific CSS overrides for Streamlit built-in widgets."""
 
+    if st.session_state.get("language") != "zh":
+        return
+
+    st.markdown(
+        """
+        <style>
+
+        /* =========================================================
+           FILE UPLOADER TRANSLATION
+        ========================================================= */
+
+        /* Main drag text */
+        [data-testid="stFileUploaderDropzoneInstructions"] span {
+            font-size: 0 !important;
+        }
+
+        /* Recreate instruction text */
+        [data-testid="stFileUploaderDropzoneInstructions"]::before {
+            content: "拖曳檔案至此";
+            display: block;
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: #111827;
+            text-align: center;
+            margin-bottom: 0.35rem;
+        }
+
+        /* Size limit text */
+        [data-testid="stFileUploaderDropzoneInstructions"] small {
+            font-size: 0 !important;
+            display: block;
+            margin-top: 0.25rem;
+        }
+
+        [data-testid="stFileUploaderDropzoneInstructions"]::after {
+            content: "每個檔案上限 200MB • PDF";
+            display: block;
+            font-size: 0.75rem;
+            color: #6B7280;
+            text-align: center;
+            margin-top: 0.15rem;
+        }
+
+        /* Browse files button */
+        [data-testid="stFileUploaderDropzone"] button * {
+            font-size: 0 !important;
+        }
+
+        [data-testid="stFileUploaderDropzone"] button::after {
+            content: "瀏覽檔案";
+            font-size: 0.9rem !important;
+            font-weight: 500;
+            color: inherit;
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 _CSS = """
 
@@ -73,6 +134,14 @@ section[data-testid="stSidebar"] .streamlit-expanderHeader {
   box-shadow: 0 10px 30px -10px rgba(10,20,40,0.15) !important;
 }
 
+/* Sidebar selectbox — black selected value text */
+section[data-testid="stSidebar"] [data-baseweb="select"],
+section[data-testid="stSidebar"] [data-baseweb="select"] *,
+section[data-testid="stSidebar"] [data-baseweb="popover"] *,
+section[data-testid="stSidebar"] [data-baseweb="menu"] * {
+    color: #000000 !important;
+}
+
 /* Tabs */
 .stTabs [aria-selected="true"] {
   background: linear-gradient(90deg, #0A1428, #1C2E55) !important;
@@ -102,6 +171,16 @@ section[data-testid="stSidebar"] .stButton > button:hover {
   box-shadow: 0 6px 14px rgba(0, 196, 168, 0.3);
 }
 
+/* PICO Query Builder — white card */
+[data-testid="stForm"] {
+  background: #FFFFFF !important;
+  border: 1px solid #E2E8F0 !important;
+  border-top: 3px solid #00C4A8 !important;
+  border-radius: 12px !important;
+  padding: 1.5rem 1.5rem 1rem !important;
+  box-shadow: 0 4px 20px -4px rgba(10,20,40,0.10) !important;
+  margin-top: 0.5rem !important;
+}
 
 /* Hide default Streamlit chrome */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {
@@ -109,3 +188,5 @@ section[data-testid="stSidebar"] .stButton > button:hover {
 }
 </style>
 """
+
+
