@@ -340,8 +340,62 @@ def _save_language(lang: str) -> None:
 if "language" not in st.session_state:
     st.session_state["language"] = _load_language()
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SAVE SEARCH HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
+def _save_search_counts_to_db(review_id: int, source_name: str,
+                               raw_n: int, intra_n: int, cross_n: int,
+                               all_dupe_list: list,
+                               active_sources: set = None) -> None:
+    """Persist per-source counts and dupe list to prisma_settings."""
+    from storage.database import get_connection
+    import json as _j
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
+                (review_id,)
+            ).fetchone()
+            ps = _j.loads(row["settings_json"]) if row else {}
 
+            # Per-source counts — overwrite on re-search of same source
+            ps[f"raw_n_{source_name}"]   = raw_n
+            ps[f"intra_n_{source_name}"] = intra_n
+            ps[f"cross_n_{source_name}"] = cross_n
+
+            # Only sum sources that are currently active (in DB or just searched)
+            # Prevents stale values from old/cleared searches contaminating total
+            _check = active_sources or {source_name}
+            ps["_duplicates_removed"] = sum(
+                ps.get(f"intra_n_{s}", 0) + ps.get(f"cross_n_{s}", 0)
+                for s in ["PubMed", "Europe PMC", "CORE"]
+                if s in _check
+            )
+
+            # Rebuild dupe list: clear old entries for this source, add new ones
+            old_list = [d for d in ps.get("_dupe_list", [])
+                        if str(d.get("source", "")).lower().replace(" ", "_")
+                        != source_name.lower().replace(" ", "_")]
+            _safe = []
+            for d in all_dupe_list:
+                if not isinstance(d, dict):
+                    continue
+                _safe.append({k: str(d.get(k) or "") for k in (
+                    "pmid", "title", "source", "year",
+                    "journal", "doi", "abstract", "_dupe_reason"
+                )})
+            ps["_dupe_list"] = old_list + _safe
+
+            conn.execute("""
+                INSERT INTO prisma_settings (review_id, settings_json, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(review_id) DO UPDATE SET
+                    settings_json = excluded.settings_json,
+                    updated_at    = CURRENT_TIMESTAMP
+            """, (review_id, _j.dumps(ps)))
+    except Exception as e:
+        logger.warning("_save_search_counts_to_db failed: %s", e)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRISMA STATE HELPERS
@@ -365,20 +419,17 @@ def _get_prisma_sources_from_db(review_id: int) -> Dict:
         if row:
             _ps = _j.loads(row["settings_json"])
 
-            # Override source counts with RAW API counts (before any dedup)
+            # Override source counts with RAW API counts (for PRISMA identification boxes)
             for _src in ["PubMed", "Europe PMC", "CORE"]:
                 _raw = _ps.get(f"raw_n_{_src}", 0)
                 if _raw:
                     source_totals[_src] = _raw
 
-            # Total duplicates = intra-source + cross-source
-            _intra = sum(_ps.get(f"intra_n_{s}", 0)
-                         for s in ["PubMed", "Europe PMC", "CORE"])
-            _cross = int(_ps.get("_duplicates_removed", 0))
-            _total_dupes = _intra + _cross
+            # _duplicates_removed is already the correct total (intra + cross)
+            # computed by _save_search_counts_to_db — use it directly, no re-sum
+            _total_dupes = int(_ps.get("_duplicates_removed", 0))
             if _total_dupes:
                 source_totals["duplicates_removed"] = _total_dupes
-                _store(review_id, "n_duplicates_removed", _total_dupes)
 
     except Exception as e:
         logger.warning("prisma_settings read failed: %s", e)
@@ -1172,57 +1223,9 @@ def _run_unified_fulltext(review_id, pmid_articles, epmc_articles_, pmc_cl, arti
     st.rerun()
 
 def _compute_cross_source_dupes(review_id, article_repo):
+    """Read persisted dupe count and list from prisma_settings."""
     from storage.database import get_connection
     import json as _j
-
-    _pub = _load(review_id, "articles_PubMed",     []) or []
-    _epm = _load(review_id, "articles_Europe PMC", []) or []
-    _cor = _load(review_id, "articles_CORE",       []) or []
-
-    # Distinguish fresh API results (Article dataclasses) from
-    # DB-restored articles (plain dicts). Only dataclasses have
-    # the full cross-source overlap — DB articles are already deduped.
-    _sample       = next(iter(_pub or _epm or _cor or []), None)
-    _is_fresh_api = _sample is not None and not isinstance(_sample, dict)
-
-    if _is_fresh_api:
-        # Fresh API data — compute correctly and persist for refresh
-        _, n_dupes, dupe_list = _deduplicate(_pub, _epm, _cor)
-        _safe = []
-        for d in dupe_list:
-            if not isinstance(d, dict):
-                continue
-            _safe.append({k: str(d.get(k) or "") for k in (
-                "pmid", "title", "source", "year",
-                "journal", "doi", "abstract", "_dupe_reason"
-            )})
-        try:
-            with get_connection() as conn:
-                row = conn.execute(
-                    "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
-                    (review_id,)
-                ).fetchone()
-                existing = _j.loads(row["settings_json"]) if row else {}
-                existing["_duplicates_removed"] = n_dupes
-                existing["_dupe_list"]          = _safe
-                # Persist raw and intra counts for PRISMA accuracy
-                for _src in ["PubMed", "Europe PMC", "CORE"]:
-                    _rn = _load(review_id, f"raw_n_{_src}",   0) or 0
-                    _in = _load(review_id, f"intra_n_{_src}", 0) or 0
-                    existing[f"raw_n_{_src}"]   = _rn
-                    existing[f"intra_n_{_src}"] = _in
-                conn.execute("""
-                    INSERT INTO prisma_settings (review_id, settings_json, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(review_id) DO UPDATE SET
-                        settings_json = excluded.settings_json,
-                        updated_at    = CURRENT_TIMESTAMP
-                """, (review_id, _j.dumps(existing)))
-        except Exception as _e:
-            logger.warning("Could not save cross-source dupes: %s", _e)
-        return n_dupes, dupe_list
-
-    # DB-restored dicts or no articles — load persisted value from DB
     try:
         with get_connection() as conn:
             row = conn.execute(
@@ -1232,9 +1235,8 @@ def _compute_cross_source_dupes(review_id, article_repo):
         if row:
             _s = _j.loads(row["settings_json"])
             return int(_s.get("_duplicates_removed", 0)), _s.get("_dupe_list", [])
-    except Exception as _e:
-        logger.warning("Could not load cross-source dupes: %s", _e)
-
+    except Exception as e:
+        logger.warning("_compute_cross_source_dupes read failed: %s", e)
     return 0, []
 
 def _render_duplicate_cards(dupe_list: list) -> None:
@@ -1450,25 +1452,31 @@ def _render_pubmed_form(review_id, registry, search_repo, article_repo):
 
     n_searched = sum(1 for x in [pubmed_articles, epmc_articles, core_articles] if x)
     if n_searched > 1:
-        # Use DB-level counts (source_totals) for accurate per-source numbers.
-        # These reflect actual unique articles in DB, not raw session results.
         _refresh_prisma_from_db(review_id)
-        db_total      = counts["total"]
-        src_totals    = search_repo.get_source_totals(review_id)
-        n_raw_all     = sum(src_totals.values())
-        n_dupes_db    = max(0, n_raw_all - db_total)
-        _store(review_id, "n_duplicates_removed", n_dupes_db)
-        _refresh_prisma_from_db(review_id)
+        db_total = counts["total"]
+
+        # Read raw counts and total dupes from prisma_settings
+        from storage.database import get_connection as _gc
+        import json as _jj
+        _ps = {}
+        try:
+            with _gc() as _conn:
+                _ps_row = _conn.execute(
+                    "SELECT settings_json FROM prisma_settings WHERE review_id = ?",
+                    (review_id,)
+                ).fetchone()
+            if _ps_row:
+                _ps = _jj.loads(_ps_row["settings_json"])
+        except Exception:
+            pass
 
         parts = []
-        for src_name in ["PubMed", "Europe PMC", "CORE",
-                         "Semantic Scholar", "OpenAlex"]:
-            n = src_totals.get(src_name, 0)
-            if n > 0:
-                parts.append(f"{src_name}: **{n}**")
-        _n_cross_dupes, _ = _compute_cross_source_dupes(review_id, article_repo)
-        _store(review_id, "n_duplicates_removed", _n_cross_dupes)
-        parts.append(f"Duplicates removed: **{_n_cross_dupes}**")
+        for src_name in ["PubMed", "Europe PMC", "CORE"]:
+            _rn = _ps.get(f"raw_n_{src_name}", 0)
+            if _rn:
+                parts.append(f"{src_name}: **{_rn}**")
+        _total_dupes = _ps.get("_duplicates_removed", 0)
+        parts.append(f"Duplicates removed: **{_total_dupes}**")
         parts.append(f"Unique in DB: **{db_total}**")
         st.info("📊 **Multi-source:** " + " | ".join(parts))
 
@@ -1574,14 +1582,39 @@ def _do_search(review_id, source_name, population, intervention,
         client = pubmed_cl if source_name == "PubMed" else epmc_cl
 
         with st.spinner(f"Searching {source_name}…"):
-            articles    = client.search_and_fetch(query, max_results)
-            _raw_n      = len(articles)
-            articles, _intra_n, _ = _deduplicate(articles)
-            _store(review_id, f"raw_n_{source_name}",   _raw_n)
-            _store(review_id, f"intra_n_{source_name}", _intra_n)
+            articles      = client.search_and_fetch(query, max_results)
+            _raw_n        = len(articles)
+
+            # Step 1 — intra-source dedup (same paper returned twice by this source)
+            articles, _intra_n, _intra_dupes = _deduplicate(articles)
+
+            # Step 2 — cross-source dedup against all previously saved articles
+            _existing    = article_repo.get_articles_for_review(review_id)
+            _cross_n     = 0
+            _cross_dupes = []
+            if _existing:
+                _all_unique, _cross_n, _cross_dupes = _deduplicate(
+                    list(_existing), articles
+                )
+                _existing_ids = {_af(a, "pmid", "") for a in _existing}
+                articles = [a for a in _all_unique
+                            if _af(a, "pmid", "") not in _existing_ids]
+
             search_id = search_repo.create_search(review_id=review_id, query=query,
-                                                  n_results=len(articles), source_name=source_name)
-            result    = article_repo.save_articles(articles, review_id, search_id)
+                                                  n_results=len(articles),
+                                                  source_name=source_name)
+            result = article_repo.save_articles(articles, review_id, search_id)
+
+            # Add DB-level duplicates (INSERT OR IGNORE catches what _deduplicate missed)
+            _db_dupes = result.get("duplicates", 0)
+            # Active sources = all sources now in DB (source_name just saved, included automatically)
+            _active_src = set(search_repo.get_source_totals(review_id).keys())
+            _save_search_counts_to_db(
+                review_id, source_name,
+                _raw_n, _intra_n, _cross_n + _db_dupes,
+                _intra_dupes + _cross_dupes,
+                active_sources=_active_src
+            )
 
         st.success(f"✅ **{len(articles)}** articles found | "
                    f"{result['saved']} new | {result['duplicates']} already in DB")
@@ -1767,15 +1800,36 @@ def _do_core_search(review_id, population, intervention, comparison,
         st.warning("CORE returned results but none could be parsed.")
         return
 
-    # Deduplicate within CORE results — same paper can appear with different CORE IDs
-    _raw_n_core    = len(articles)
-    articles, _intra_n_core, _ = _deduplicate(articles)
-    _store(review_id, "raw_n_CORE",   _raw_n_core)
-    _store(review_id, "intra_n_CORE", _intra_n_core)
+    # Step 1 — intra-source dedup
+    _raw_n_core = len(articles)
+    articles, _intra_n_core, _intra_dupes_core = _deduplicate(articles)
+
+    # Step 2 — cross-source dedup against all previously saved articles
+    _existing_core    = article_repo.get_articles_for_review(review_id)
+    _cross_n_core     = 0
+    _cross_dupes_core = []
+    if _existing_core:
+        _all_unique_core, _cross_n_core, _cross_dupes_core = _deduplicate(
+            list(_existing_core), articles
+        )
+        _existing_ids_core = {_af(a, "pmid", "") for a in _existing_core}
+        articles = [a for a in _all_unique_core
+                    if _af(a, "pmid", "") not in _existing_ids_core]
 
     search_id = search_repo.create_search(review_id=review_id, query=query,
                                           n_results=len(articles), source_name="CORE")
-    result    = article_repo.save_articles(articles, review_id, search_id)
+    result = article_repo.save_articles(articles, review_id, search_id)
+
+    # Add DB-level duplicates caught by INSERT OR IGNORE
+    _db_dupes_core = result.get("duplicates", 0)
+    # Active sources = all sources now in DB (CORE just saved, included automatically)
+    _active_src_core = set(search_repo.get_source_totals(review_id).keys())
+    _save_search_counts_to_db(
+        review_id, "CORE",
+        _raw_n_core, _intra_n_core, _cross_n_core + _db_dupes_core,
+        _intra_dupes_core + _cross_dupes_core,
+        active_sources=_active_src_core
+    )
 
     # Store CORE PDF URLs in session state for the Full Texts pipeline
     _store(review_id, "core_pdf_urls", _core_pdf_urls)
